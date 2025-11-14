@@ -1339,30 +1339,36 @@ private:
 
   SyncOutcome run_single_watch(const WatchEntry& entry) {
     SyncOutcome outcome;
-    if(entry.source_peer.empty()) {
+    if(entry.sources.empty()) {
       outcome.success = false;
       return outcome;
     }
 
-    if(entry.source_peer == pm_->local_peer_id()) {
+    const auto& source = entry.sources.front();
+    if(source.peer.empty()) {
+      outcome.success = false;
+      return outcome;
+    }
+
+    if(source.peer == pm_->local_peer_id()) {
       return outcome;
     }
 
     ListCommand cmd;
-    if(!entry.source_dir_guid.empty()) {
+    if(!entry.dir_guid.empty()) {
       cmd.type = ListCommand::Type::RemoteDirectoryGuid;
-      cmd.peer = entry.source_peer;
-      cmd.dir_guid = entry.source_dir_guid;
+      cmd.peer = source.peer;
+      cmd.dir_guid = entry.dir_guid;
     } else {
       cmd.type = ListCommand::Type::RemotePath;
-      cmd.peer = entry.source_peer;
-      cmd.path = entry.source_path;
+      cmd.peer = source.peer;
+      cmd.path = source.path;
     }
 
-    auto entries = blocking_list_peer(entry.source_peer,
-                                      entry.source_dir_guid.empty() ? entry.source_path : "",
+    auto entries = blocking_list_peer(source.peer,
+                                      entry.dir_guid.empty() ? source.path : "",
                                       "",
-                                      entry.source_dir_guid);
+                                      entry.dir_guid);
     entries.erase(std::remove_if(entries.begin(), entries.end(),
       [](const PeerManager::RemoteListingItem& item){
         return is_internal_listing_path(item.relative_path);
@@ -1394,10 +1400,18 @@ private:
   }
 
   WatchEntry* find_watch_by_peer_path(const std::string& peer, const std::string& path) {
+    auto normalized = normalize_cli_path(path);
     for(auto& entry : watches_) {
       for(const auto& src : entry.sources) {
-        if(src.peer == peer && src.path == path) return &entry;
+        if(src.peer == peer && src.path == normalized) return &entry;
       }
+    }
+    return nullptr;
+  }
+
+  WatchEntry* find_watch_by_id(const std::string& id) {
+    for(auto& entry : watches_) {
+      if(entry.id == id) return &entry;
     }
     return nullptr;
   }
