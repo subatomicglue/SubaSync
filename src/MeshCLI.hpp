@@ -40,12 +40,12 @@
 
 #include "peer_manager.hpp"
 #include "utils.hpp"
-#include "CommandLineOptions.hpp"
+#include "settings_manager.hpp"
 
 class MeshCLI {
 public:
   explicit MeshCLI(std::shared_ptr<PeerManager> pm,
-                   std::shared_ptr<CommandLineOptions> settings,
+                   std::shared_ptr<SettingsManager> settings,
                    std::chrono::seconds default_watch_interval = std::chrono::seconds(60),
                    bool audio_notifications = false)
     : pm_(std::move(pm)), settings_(std::move(settings)), running_(true),
@@ -54,6 +54,7 @@ public:
     index_share_root();
     load_ignore_config();
     apply_setting_side_effects("audio_notifications");
+    apply_setting_side_effects("transfer_debug");
     pm_->set_listing_refresh_callback([this](){
       index_share_root();
     });
@@ -97,7 +98,7 @@ private:
   };
 
   std::shared_ptr<PeerManager> pm_;
-  std::shared_ptr<CommandLineOptions> settings_;
+  std::shared_ptr<SettingsManager> settings_;
   std::atomic<bool> running_;
   std::thread cli_thread_;
   std::chrono::seconds default_watch_interval_;
@@ -2175,6 +2176,7 @@ private:
     if(action == "load") {
       if(settings_->load()) {
         apply_setting_side_effects("audio_notifications");
+        apply_setting_side_effects("transfer_debug");
         std::cout << "Loaded settings from " << settings_->settings_path() << "\n";
       } else {
         std::cout << "Settings file not found; defaults restored.\n";
@@ -2199,6 +2201,15 @@ private:
     if(key == "audio_notifications") {
       try {
         audio_notifications_ = settings_->get<bool>("audio_notifications");
+      } catch(...) {
+        // ignore
+      }
+    } else if(key == "transfer_debug") {
+      try {
+        bool enabled = settings_->get<bool>("transfer_debug");
+        if(pm_) {
+          pm_->set_transfer_debug(enabled);
+        }
       } catch(...) {
         // ignore
       }

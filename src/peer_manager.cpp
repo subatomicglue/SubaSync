@@ -16,6 +16,8 @@
 #include "base64.h"
 #include "utils.hpp"
 
+
+
 namespace {
 
 std::string normalize_relative_path(const std::string& input) {
@@ -398,6 +400,14 @@ std::optional<std::string> PeerManager::directory_origin(const std::string& guid
   return it->second;
 }
 
+void PeerManager::set_transfer_debug(bool enabled){
+  transfer_debug_.store(enabled, std::memory_order_relaxed);
+}
+
+bool PeerManager::transfer_debug_enabled() const{
+  return transfer_debug_.load(std::memory_order_relaxed);
+}
+
 std::string PeerManager::generate_directory_guid(){
   static thread_local std::mt19937_64 rng(std::random_device{}());
   std::uniform_int_distribution<uint64_t> dist;
@@ -768,6 +778,7 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
   };
 
   auto current_peer_id = conn->peer_id();
+  const bool transfer_debug = transfer_debug_.load(std::memory_order_relaxed);
 
   if(type == "peer_announce"){
     std::string peer_id = j.value("peer_id", "");
@@ -859,12 +870,27 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
     std::string hash = j.value("hash", "");
     uint64_t offset = j.value("offset", 0ULL);
     std::size_t length = j.value("length", static_cast<std::size_t>(PeerManager::kMaxChunkSize));
+    std::string requester = current_peer_id.empty() ? j.value("peer_id", "") : current_peer_id;
+    std::string peer_label = requester.empty() ? "<unknown>" : requester;
     if(request_id.empty() || hash.empty()){
+      if(transfer_debug){
+        log_info("[transfer] chunk request from {} ignored due to missing metadata (request_id='{}', hash='{}')",
+                 peer_label, request_id, hash);
+      }
       return;
+    }
+
+    if(transfer_debug){
+      log_info("[transfer] <= chunk request {} hash {} offset {} length {} from {}",
+               request_id, hash, offset, length, peer_label);
     }
 
     SharedFileEntry entry;
     if(!find_local_file_by_hash(hash, entry)){
+      if(transfer_debug){
+        log_info("[transfer] chunk request {} for hash {} from {} failed: unknown hash",
+                 request_id, hash, peer_label);
+      }
       nlohmann::json err;
       err["type"] = "file_chunk_response";
       err["request_id"] = request_id;
@@ -875,6 +901,10 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
     }
 
     if(offset >= entry.size){
+      if(transfer_debug){
+        log_info("[transfer] chunk request {} for hash {} from {} failed: offset {} >= size {}",
+                 request_id, hash, peer_label, offset, entry.size);
+      }
       nlohmann::json err;
       err["type"] = "file_chunk_response";
       err["request_id"] = request_id;
@@ -890,6 +920,10 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
 
     std::ifstream file(entry.full_path, std::ios::binary);
     if(!file){
+      if(transfer_debug){
+        log_info("[transfer] chunk request {} for hash {} from {} failed: cannot open {}",
+                 request_id, hash, peer_label, entry.full_path.string());
+      }
       nlohmann::json err;
       err["type"] = "file_chunk_response";
       err["request_id"] = request_id;
@@ -904,6 +938,10 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
     file.read(buffer.data(), static_cast<std::streamsize>(clamped_length));
     std::streamsize read_bytes = file.gcount();
     if(read_bytes <= 0){
+      if(transfer_debug){
+        log_info("[transfer] chunk request {} for hash {} from {} failed: read {} bytes",
+                 request_id, hash, peer_label, read_bytes);
+      }
       nlohmann::json err;
       err["type"] = "file_chunk_response";
       err["request_id"] = request_id;
@@ -925,6 +963,10 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
     resp["length"] = buffer.size();
     resp["chunk_sha"] = chunk_sha;
     resp["data"] = encoded;
+    if(transfer_debug){
+      log_info("[transfer] => sending {} bytes for hash {} offset {} to {} (request {})",
+               buffer.size(), hash, offset, peer_label, request_id);
+    }
     send(resp);
   } else if(type == "file_chunk_response"){
     std::string request_id = j.value("request_id", "");
@@ -932,6 +974,7 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
     uint64_t offset = j.value("offset", 0ULL);
     std::string error = j.value("error", "");
     std::string response_peer = current_peer_id.empty() ? j.value("peer_id", "") : current_peer_id;
+    std::string peer_label = response_peer.empty() ? "<unknown>" : response_peer;
     ChunkResponse response;
     response.peer_id = response_peer;
     response.hash = hash;
@@ -945,6 +988,15 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
       response.data.assign(decoded.begin(), decoded.end());
       response.chunk_sha = j.value("chunk_sha", "");
       response.success = true;
+    }
+    if(transfer_debug){
+      if(response.success){
+        log_info("[transfer] <= received {} bytes for hash {} offset {} from {} (request {})",
+                 response.data.size(), hash, offset, peer_label, request_id);
+      } else {
+        log_info("[transfer] chunk response {} for hash {} offset {} from {} failed: {}",
+                 request_id, hash, offset, peer_label, response.error);
+      }
     }
     handle_file_chunk_response(response_peer, request_id, std::move(response));
   } else if(type == "file_request"){
@@ -1017,10 +1069,18 @@ std::optional<std::string> PeerManager::request_file_chunk(const std::string& pe
   req["hash"] = hash;
   req["offset"] = offset;
   req["length"] = length;
+  const bool transfer_debug = transfer_debug_.load(std::memory_order_relaxed);
+  if(transfer_debug){
+    log_info("[transfer] => requesting hash {} offset {} length {} from {} (request {})",
+             hash, offset, length, peer_id, request_id);
+  }
   if(send_json_to_peer(peer_id, req)){
     return request_id;
   }
 
+  if(transfer_debug){
+    log_info("[transfer] chunk request {} to {} failed to send", request_id, peer_id);
+  }
   cancel_chunk_request(request_id);
   return std::nullopt;
 }

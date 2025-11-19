@@ -8,7 +8,7 @@
 #include "peer_manager.hpp"
 #include "protocol.hpp"
 #include "MeshCLI.hpp"
-#include "CommandLineOptions.hpp"
+#include "settings_manager.hpp"
 #include "log.hpp"
 
 using asio::ip::tcp;
@@ -75,7 +75,7 @@ std::string get_unique_display_name() {
 
 int main(int argc, char** argv){
   try {
-    auto settings = std::make_shared<CommandLineOptions>();
+    auto settings = std::make_shared<SettingsManager>();
     settings->init(argc, argv);
 
     init(settings->get<bool>("verbose"));
@@ -137,6 +137,7 @@ int main(int argc, char** argv){
                                       local_addr,
                                       external_addr,
                                       6);
+    pm->set_transfer_debug(settings->get<bool>("transfer_debug"));
 
     // Start acceptor
     tcp::acceptor acceptor(io, tcp::endpoint(asio::ip::make_address(listen_ip), listen_port));

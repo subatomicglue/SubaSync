@@ -167,6 +167,9 @@ public:
     void set_directory_origin(const std::string& guid, const std::string& origin_peer);
     std::optional<std::string> directory_origin(const std::string& guid) const;
 
+    void set_transfer_debug(bool enabled);
+    bool transfer_debug_enabled() const;
+
 private:
     asio::io_context& io_;
     std::string local_peer_id_;
@@ -195,6 +198,7 @@ private:
     std::function<void(const std::string&, const std::string&)> chat_callback_;
     mutable std::mutex chat_callback_mutex_;
     std::function<void()> listing_refresh_callback_;
+    std::atomic<bool> transfer_debug_{false};
 
     std::string ensure_directory_guid(const std::string& relative_path);
     std::optional<std::string> resolve_directory_guid(const std::string& guid) const;

@@ -17,8 +17,8 @@ end tell
 EOF
 }
 
-launch_terminal_mac "$SYNC_DIR/sandbox1" "../sync 9000 127.0.0.1 '' peerA" "sync-peerA"
-launch_terminal_mac "$SYNC_DIR/sandbox2" "../sync 9001 127.0.0.1 127.0.0.1:9000 peerB" "sync-peerB"
-launch_terminal_mac "$SYNC_DIR/sandbox3" "../sync 9002 127.0.0.1 127.0.0.1:9001 peerC" "sync-peerC"
+launch_terminal_mac "$SYNC_DIR/sandbox1" "../sync 9000 127.0.0.1 '' peerA --save true" "sync-peerA"
+launch_terminal_mac "$SYNC_DIR/sandbox2" "../sync 9001 127.0.0.1 127.0.0.1:9000 peerB --save true" "sync-peerB"
+launch_terminal_mac "$SYNC_DIR/sandbox3" "../sync 9002 127.0.0.1 127.0.0.1:9001 peerC --save true" "sync-peerC"
 
 echo "Launched 3 sync nodes in Terminal windows."

@@ -4,12 +4,15 @@ release: ./build/Release/sync
 debug: ./build/Debug/sync
 
 establish_dirs:
-	rm -rf build/Release/sandbox1
-	rm -rf build/Release/sandbox2
-	rm -rf build/Release/sandbox3
-	mkdir -p build/Release/sandbox1/share
-	mkdir -p build/Release/sandbox2/share
-	mkdir -p build/Release/sandbox3/share
+	rm -rf build/Release/sandbox1 && mkdir -p build/Release/sandbox1/share/.config
+	rm -rf build/Release/sandbox2 && mkdir -p build/Release/sandbox2/share/.config
+	rm -rf build/Release/sandbox3 && mkdir -p build/Release/sandbox3/share/.config
+	ln -s `pwd`/sandbox1-settings.json build/Release/sandbox1/share/.config/settings.json
+	ln -s `pwd`/sandbox2-settings.json build/Release/sandbox2/share/.config/settings.json
+	ln -s `pwd`/sandbox3-settings.json build/Release/sandbox3/share/.config/settings.json
+	ln -s `pwd`/sandbox1-watches.json build/Release/sandbox1/watches.json
+	ln -s `pwd`/sandbox2-watches.json build/Release/sandbox2/watches.json
+	ln -s `pwd`/sandbox3-watches.json build/Release/sandbox3/watches.json
 	cp SUMMARY.md build/Release/sandbox1/share/
 	cp README.md build/Release/sandbox2/share/
 	mkdir -p build/Release/sandbox1/share/myfiles
