@@ -11,6 +11,7 @@
 #include <set>
 #include <functional>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include "protocol.hpp"
 
 struct PeerInfo {
@@ -52,6 +53,7 @@ public:
       uint64_t size = 0;
       bool is_directory = false;
       std::string directory_guid;
+      std::string origin_peer;
     };
 
     struct ChunkResponse {
@@ -144,6 +146,7 @@ public:
                              const std::string& dir_guid);
 
     bool send_json_to_peer(const std::string& peer_id, const nlohmann::json& j);
+    void handle_message(std::shared_ptr<Connection> conn, const nlohmann::json& message);
 
     std::optional<std::string> request_file_chunk(const std::string& peer_id,
                                                   const std::string& hash,
@@ -160,6 +163,9 @@ public:
     void set_chat_callback(std::function<void(const std::string&, const std::string&)> cb);
     void dispatch_chat_message(const std::string& from_peer,
                                const std::string& text);
+
+    void set_directory_origin(const std::string& guid, const std::string& origin_peer);
+    std::optional<std::string> directory_origin(const std::string& guid) const;
 
 private:
     asio::io_context& io_;
@@ -179,6 +185,7 @@ private:
     std::unordered_map<std::string, std::string> path_to_hash_;
     std::unordered_map<std::string, std::string> path_to_dir_guid_;
     std::unordered_map<std::string, std::string> dir_guid_to_path_;
+    std::unordered_map<std::string, std::string> dir_guid_origin_;
 
     std::unordered_map<std::string, ListResponseHandler> pending_list_requests_;
     std::atomic<uint64_t> list_request_counter_{0};

@@ -1,6 +1,7 @@
 #include "peer_manager.hpp"
 #include "connection.hpp"
 #include "log.hpp"
+#include "protocol.hpp"
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -10,6 +11,10 @@
 #include <filesystem>
 #include <random>
 #include <exception>
+#include <fstream>
+#include <iterator>
+#include "base64.h"
+#include "utils.hpp"
 
 namespace {
 
@@ -296,6 +301,7 @@ void PeerManager::register_directory_hierarchy(const std::string& relative_path)
     } while(dir_guid_to_path_.count(guid));
     path_to_dir_guid_[dir] = guid;
     dir_guid_to_path_[guid] = dir;
+    dir_guid_origin_[guid] = local_peer_id_;
   }
 }
 
@@ -372,6 +378,24 @@ void PeerManager::register_directory_with_guid(const std::string& relative_path,
 
   path_to_dir_guid_[normalized] = guid;
   dir_guid_to_path_[guid] = normalized;
+}
+
+void PeerManager::set_directory_origin(const std::string& guid, const std::string& origin_peer){
+  if(guid.empty()) return;
+  std::lock_guard lg(m_);
+  if(origin_peer.empty()){
+    dir_guid_origin_.erase(guid);
+  } else {
+    dir_guid_origin_[guid] = origin_peer;
+  }
+}
+
+std::optional<std::string> PeerManager::directory_origin(const std::string& guid) const{
+  if(guid.empty()) return std::nullopt;
+  std::lock_guard lg(m_);
+  auto it = dir_guid_origin_.find(guid);
+  if(it == dir_guid_origin_.end()) return std::nullopt;
+  return it->second;
 }
 
 std::string PeerManager::generate_directory_guid(){
@@ -470,6 +494,12 @@ std::vector<PeerManager::RemoteListingItem> PeerManager::local_listing_items_for
     item.size = 0;
     item.is_directory = true;
     item.directory_guid = kv.second;
+    auto origin_it = dir_guid_origin_.find(item.directory_guid);
+    if(origin_it != dir_guid_origin_.end()) {
+      item.origin_peer = origin_it->second;
+    } else {
+      item.origin_peer = local_peer_id_;
+    }
     directories.push_back(std::move(item));
   }
 
@@ -490,6 +520,7 @@ std::vector<PeerManager::RemoteListingItem> PeerManager::local_listing_items_for
     item.relative_path = entry.relative_path;
     item.size = entry.size;
     item.is_directory = false;
+    item.origin_peer.clear();
     files.push_back(std::move(item));
   }
 
@@ -649,6 +680,9 @@ void PeerManager::handle_list_response(const std::string& peer_id,
   auto decorated = items;
   for(auto& item : decorated){
     if(item.peer_id.empty()) item.peer_id = peer_id;
+    if(item.origin_peer.empty() && item.is_directory) {
+      item.origin_peer = peer_id;
+    }
   }
   handler(decorated);
 }
@@ -692,6 +726,19 @@ void PeerManager::handle_list_request(const std::string& peer_id,
     }
   } else if(!dir_guid.empty()){
     items = local_listing_for_dir_guid(dir_guid);
+    RemoteListingItem root;
+    root.peer_id = local_peer_id_;
+    root.hash.clear();
+    root.relative_path.clear();
+    root.size = 0;
+    root.is_directory = true;
+    root.directory_guid = dir_guid;
+    if(auto origin = directory_origin(dir_guid)) {
+      root.origin_peer = *origin;
+    } else {
+      root.origin_peer = local_peer_id_;
+    }
+    items.insert(items.begin(), root);
   } else {
     items = local_listing_items_for_path(relative_path);
   }
@@ -704,10 +751,248 @@ void PeerManager::handle_list_request(const std::string& peer_id,
     item["size"] = entry.size;
     item["is_dir"] = entry.is_directory;
     if(!entry.directory_guid.empty()) item["dir_guid"] = entry.directory_guid;
+    if(!entry.origin_peer.empty()) item["origin"] = entry.origin_peer;
     arr.push_back(item);
   }
   resp["entries"] = arr;
   send_json_to_peer(peer_id, resp);
+}
+
+void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohmann::json& j){
+  if(!conn) return;
+  const std::string type = j.value("type", "");
+  if(type.empty()) return;
+
+  auto send = [&](const nlohmann::json& payload){
+    conn->async_send_json(payload);
+  };
+
+  auto current_peer_id = conn->peer_id();
+
+  if(type == "peer_announce"){
+    std::string peer_id = j.value("peer_id", "");
+    std::string display_name = j.value("display_name", "");
+    std::string local_addr = j.value("local_addr", "");
+    std::string external_addr = j.value("external_addr", "");
+    int ttl = j.value("ttl", kPeerAnnounceDefaultTTL);
+
+    if(peer_id.empty() || local_addr.empty()) return;
+
+    add_peer_discovered(peer_id, display_name, local_addr, external_addr);
+
+    if(ttl > 1){
+      nlohmann::json fwd = j;
+      fwd["ttl"] = ttl - 1;
+      broadcast_json(fwd, peer_id);
+    }
+
+    if(current_peer_id.empty()){
+      conn->set_peer_id(peer_id);
+      current_peer_id = peer_id;
+      on_connected(peer_id, conn);
+    } else if(current_peer_id == peer_id){
+      // already bound to this peer; nothing additional needed
+    } else if(ttl >= kPeerAnnounceDefaultTTL){
+      log_warn("Connection reported different peer_id {} (previously {})", peer_id, current_peer_id);
+      conn->set_peer_id(peer_id);
+      current_peer_id = peer_id;
+      on_connected(peer_id, conn);
+    } else {
+      // Forwarded peer announcements travel over existing connections; nothing to do.
+    }
+  } else if(type == "peer_list"){
+    auto arr = j.value("peers", nlohmann::json::array());
+    if(arr.is_array()){
+      for(const auto& item : arr){
+        std::string pid = item.value("peer_id", "");
+        std::string dname = item.value("display_name", "");
+        std::string local_addr = item.value("local_addr", "");
+        std::string external_addr = item.value("external_addr", "");
+        if(!pid.empty()){
+          add_peer_discovered(pid, dname, local_addr, external_addr);
+          nlohmann::json fwd = make_peer_announce(pid, local_addr, dname, external_addr, 3);
+          broadcast_json(fwd, pid);
+        }
+      }
+      attempt_connect_more();
+    }
+  } else if(type == "chat"){
+    std::string from = j.value("from", current_peer_id.empty() ? "unknown" : current_peer_id);
+    std::string text = j.value("text", "");
+    dispatch_chat_message(from, text);
+  } else if(type == "share"){
+    std::string hash = j.value("hash", "");
+    std::string fname = j.value("filename", "");
+    std::string origin = current_peer_id.empty() ? j.value("peer_id", "unknown") : current_peer_id;
+    print_out("[{}] shared file {} -> {}", origin, fname, hash);
+  } else if(type == "list_request"){
+    std::string request_id = j.value("request_id", "");
+    std::string path = j.value("path", "");
+    std::string hash = j.value("hash", "");
+    std::string dir_guid = j.value("dir_guid", "");
+    if(!request_id.empty()){
+      std::string requester = current_peer_id.empty() ? j.value("peer_id", "") : current_peer_id;
+      handle_list_request(requester, request_id, path, hash, dir_guid);
+    }
+  } else if(type == "list_response"){
+    std::string request_id = j.value("request_id", "");
+    std::string from_peer = j.value("peer_id", current_peer_id);
+    std::vector<RemoteListingItem> items;
+    if(j.contains("entries") && j["entries"].is_array()){
+      for(const auto& entry : j["entries"]){
+        RemoteListingItem item;
+        item.peer_id = from_peer;
+        item.hash = entry.value("hash", "");
+        item.relative_path = entry.value("path", "");
+        item.size = entry.value("size", 0ULL);
+        item.is_directory = entry.value("is_dir", false);
+        item.directory_guid = entry.value("dir_guid", "");
+        item.origin_peer = entry.value("origin", "");
+        items.push_back(std::move(item));
+      }
+    }
+    if(!request_id.empty()){
+      handle_list_response(from_peer, request_id, items);
+    }
+  } else if(type == "file_chunk_request"){
+    std::string request_id = j.value("request_id", "");
+    std::string hash = j.value("hash", "");
+    uint64_t offset = j.value("offset", 0ULL);
+    std::size_t length = j.value("length", static_cast<std::size_t>(PeerManager::kMaxChunkSize));
+    if(request_id.empty() || hash.empty()){
+      return;
+    }
+
+    SharedFileEntry entry;
+    if(!find_local_file_by_hash(hash, entry)){
+      nlohmann::json err;
+      err["type"] = "file_chunk_response";
+      err["request_id"] = request_id;
+      err["hash"] = hash;
+      err["error"] = "Unknown file hash";
+      send(err);
+      return;
+    }
+
+    if(offset >= entry.size){
+      nlohmann::json err;
+      err["type"] = "file_chunk_response";
+      err["request_id"] = request_id;
+      err["hash"] = hash;
+      err["error"] = "Offset beyond file size";
+      send(err);
+      return;
+    }
+
+    std::size_t clamped_length = std::min<std::size_t>(length ? length : PeerManager::kMaxChunkSize,
+                                                       static_cast<std::size_t>(entry.size - offset));
+    clamped_length = std::min<std::size_t>(clamped_length, PeerManager::kMaxChunkSize);
+
+    std::ifstream file(entry.full_path, std::ios::binary);
+    if(!file){
+      nlohmann::json err;
+      err["type"] = "file_chunk_response";
+      err["request_id"] = request_id;
+      err["hash"] = hash;
+      err["error"] = "Cannot open file";
+      send(err);
+      return;
+    }
+
+    file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    std::vector<char> buffer(clamped_length);
+    file.read(buffer.data(), static_cast<std::streamsize>(clamped_length));
+    std::streamsize read_bytes = file.gcount();
+    if(read_bytes <= 0){
+      nlohmann::json err;
+      err["type"] = "file_chunk_response";
+      err["request_id"] = request_id;
+      err["hash"] = hash;
+      err["error"] = "Failed to read file chunk";
+      send(err);
+      return;
+    }
+    buffer.resize(static_cast<std::size_t>(read_bytes));
+
+    std::string encoded = base64_encode(reinterpret_cast<const unsigned char*>(buffer.data()), buffer.size());
+    std::string chunk_sha = sha256_hex(std::string(buffer.data(), buffer.size()));
+
+    nlohmann::json resp;
+    resp["type"] = "file_chunk_response";
+    resp["request_id"] = request_id;
+    resp["hash"] = hash;
+    resp["offset"] = offset;
+    resp["length"] = buffer.size();
+    resp["chunk_sha"] = chunk_sha;
+    resp["data"] = encoded;
+    send(resp);
+  } else if(type == "file_chunk_response"){
+    std::string request_id = j.value("request_id", "");
+    std::string hash = j.value("hash", "");
+    uint64_t offset = j.value("offset", 0ULL);
+    std::string error = j.value("error", "");
+    std::string response_peer = current_peer_id.empty() ? j.value("peer_id", "") : current_peer_id;
+    ChunkResponse response;
+    response.peer_id = response_peer;
+    response.hash = hash;
+    response.offset = offset;
+    if(!error.empty()){
+      response.success = false;
+      response.error = error;
+    } else {
+      std::string data_encoded = j.value("data", "");
+      std::string decoded = base64_decode(data_encoded);
+      response.data.assign(decoded.begin(), decoded.end());
+      response.chunk_sha = j.value("chunk_sha", "");
+      response.success = true;
+    }
+    handle_file_chunk_response(response_peer, request_id, std::move(response));
+  } else if(type == "file_request"){
+    std::string hash = j.value("hash", "");
+    if(hash.empty()) return;
+
+    SharedFileEntry entry;
+    if(find_local_file_by_hash(hash, entry)){
+      const auto& path = entry.full_path;
+      std::ifstream file(path, std::ios::binary);
+      if(file){
+        std::vector<char> buf((std::istreambuf_iterator<char>(file)),
+                              std::istreambuf_iterator<char>());
+        std::string b64 = base64_encode(reinterpret_cast<const unsigned char*>(buf.data()), buf.size());
+
+        nlohmann::json resp;
+        resp["type"] = "file_response";
+        resp["hash"] = hash;
+        resp["filename"] = path.filename().string();
+        resp["data"] = b64;
+        send(resp);
+        std::string origin = current_peer_id.empty() ? j.value("peer_id", "unknown") : current_peer_id;
+        print_out("[{}] sending file {}", origin, path.string());
+      } else {
+        nlohmann::json err;
+        err["type"] = "file_error";
+        err["hash"] = hash;
+        err["reason"] = "Cannot open file";
+        send(err);
+      }
+    }
+  } else if(type == "file_response"){
+    std::string hash = j.value("hash", "");
+    std::string fname = j.value("filename", "");
+    std::string data = j.value("data", "");
+    if(hash.empty() || data.empty()) return;
+
+    auto bytes = base64_decode(data);
+    std::filesystem::path outpath = std::filesystem::current_path() / "download" / fname;
+    std::filesystem::create_directories(outpath.parent_path());
+
+    std::ofstream out(outpath, std::ios::binary);
+    out.write(bytes.data(), bytes.size());
+    std::string origin = current_peer_id.empty() ? j.value("peer_id", "unknown") : current_peer_id;
+    print_out("[{}] received file {} -> {}", origin, fname, outpath.string());
+  } else {
+    log_info("Unknown message type: {}", type);
+  }
 }
 
 std::optional<std::string> PeerManager::request_file_chunk(const std::string& peer_id,

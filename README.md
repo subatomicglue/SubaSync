@@ -36,6 +36,14 @@ Build Instructions
 
 You can also run the provided `run.sh` script to spawn three CLI instances that emulate separate peers. Use `kill.sh` to terminate them.
 
+Iterate on development
+----------------------
+Useful one-liner to iterate using 3 peers on your desktop:
+```
+# kill and run work on MacOS...
+./kill.sh ; make && ./run.sh
+```
+
 Using the CLI
 -------------
 Start the application (`build/Release/sync` or `build/Debug/sync`) and interact at the `>` prompt.
@@ -43,7 +51,7 @@ Start the application (`build/Release/sync` or `build/Debug/sync`) and interact 
 - `peers` – List known peers and their states.
 - `list`, `ls`, `l` – Display local or remote listings. Supply `peer:/path`, a hash, or leave blank for local.
 - `la` – Alias for `list all`; optionally append extra arguments (e.g., `la peerA:/docs`).
-- `watch add <peer:/path> [dest/]` – Configure a periodic sync. Watches now queue their first background run after the default interval, avoiding duplicate "sync failed" messages caused by overlapping jobs.
+- `watch add <peer:/path> [dest/]` – Configure a periodic sync keyed by directory GUID; rerun the command with another peer or GUID to extend the trusted source list. The first trusted peer becomes the origin for directory layout.
 - `watch list` / `watch remove` / `watch interval <seconds>` – Manage existing watches.
 - `sync` – Force all configured watches to run immediately; `sync <target>` still performs a one-off pull from the specified peer/hash.
 - `conflict [list|accept|ignore]` – Inspect pending download conflicts, overwrite with approval, or persistently skip specific paths/hashes/dir GUIDs.
@@ -54,6 +62,17 @@ Start the application (`build/Release/sync` or `build/Debug/sync`) and interact 
 - `share <path>` – Add local content to the mesh catalog.
 - `dirs` – Display share and staging directories.
 - `quit` – Exit.
+
+Digital Library Mirroring
+-------------------------
+- Watches are keyed by directory GUIDs. The first `watch add peerX:/path` resolves that GUID and records peerX as a trusted source. Adding the same path (or explicit GUID) from another peer appends that peer to the trust list instead of creating a duplicate watch.
+- Trust is one-way: SubaSync never auto-subscribes a new peer. When a non-trusted peer advertises a directory GUID you already follow, the CLI prints a reminder with the exact `watch add peerY:/dir-...` command so you can opt-in manually.
+- Each watch has an origin peer (displayed in `watch list`) that defines directory structure; if that peer is offline, SubaSync walks the remaining trusted peers in order until it finds a valid listing.
+- Origin metadata rides along with shared directory GUIDs, so downstream mirrors continue to recognize the original source even when syncing from intermediary peers.
+- You can prune individual sources with `watch remove peer:/path` (or `peer:dir-guid`) without touching the rest of the watch. Removing by watch ID or directory GUID drops the entire entry. Removing the origin automatically promotes the next trusted peer as the new origin.
+- During syncs, the CLI warns if the same file hash is offered at multiple paths within the watched GUID. Treat that as a prompt to inspect before accepting reorganizations or potential tampering.
+- Because only trusted peers feed a watch, the default behavior favors safety: nothing new arrives unless you explicitly approve the directory or source, and any conflicting overwrites are routed through the conflict queue.
+- File downloads still swarm across all known providers, but if a completed transfer fails its final hash check, the CLI retries once with trusted peers only before queuing a conflict.
 
 Configuration
 -------------

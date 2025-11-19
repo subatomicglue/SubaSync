@@ -15,6 +15,7 @@
 #include <fstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <set>
 #include <functional>
 #include <mutex>
@@ -111,6 +112,7 @@ private:
     };
     std::vector<Source> sources;
     std::string dir_guid;
+    std::string origin_peer;
     std::string dest_path;
     bool dest_is_directory = true;
     std::chrono::seconds interval{60};
@@ -120,6 +122,11 @@ private:
   struct SyncOutcome {
     bool success = true;
     bool changed = false;
+  };
+
+  struct ResolvedDirGuid {
+    std::string guid;
+    std::string origin_peer;
   };
 
   struct ConflictEntry {
@@ -739,12 +746,14 @@ private:
         return is_internal_listing_path(item.relative_path);
       }), entries.end());
 
+    notify_untrusted_directory_sources(entries);
+
     if(entries.empty()) {
       std::cout << "Nothing to sync.\n";
       return;
     }
 
-    auto result = perform_sync(*parsed, std::move(entries), dest_override, dest_is_directory, false);
+    auto result = perform_sync(*parsed, std::move(entries), dest_override, dest_is_directory, false, nullptr);
     if(!result.success) {
       std::cout << "Sync failed.\n";
     } else if(!result.changed) {
@@ -756,10 +765,21 @@ private:
                            std::vector<PeerManager::RemoteListingItem> entries,
                            const std::optional<std::string>& dest_override,
                            bool dest_is_directory,
-                           bool quiet = false) {
+                           bool quiet = false,
+                           const WatchEntry* watch_context = nullptr) {
     SyncOutcome outcome;
     std::filesystem::path dest_base = dest_override ? std::filesystem::path(*dest_override) : std::filesystem::path();
     dest_base = sanitize_relative(dest_base);
+
+    entries.erase(std::remove_if(entries.begin(), entries.end(),
+      [](const PeerManager::RemoteListingItem& item){
+        return item.is_directory && item.relative_path.empty();
+      }), entries.end());
+
+    if(watch_context) {
+      std::string guid_hint = (cmd.type == ListCommand::Type::RemoteDirectoryGuid) ? cmd.dir_guid : "";
+      maybe_warn_duplicate_hashes_for_guid(watch_context, guid_hint, entries);
+    }
 
     // Handle directories first so that child files have parents prepared.
     for(const auto& item : entries) {
@@ -785,7 +805,20 @@ private:
           pm_->register_directory(dir_string);
         }
       }
-      auto dir_result = sync_directory(item.peer_id, item.relative_path, dir_dest, quiet);
+      auto dir_result = sync_directory(item.peer_id,
+                                       item.relative_path,
+                                       item.directory_guid,
+                                       dir_dest,
+                                       quiet,
+                                       watch_context);
+      if(!item.directory_guid.empty()) {
+        std::string origin_source = !item.origin_peer.empty()
+          ? item.origin_peer
+          : (watch_context && !watch_context->origin_peer.empty() ? watch_context->origin_peer : item.peer_id);
+        if(!origin_source.empty()) {
+          pm_->set_directory_origin(item.directory_guid, origin_source);
+        }
+      }
       outcome.success &= dir_result.success;
       outcome.changed |= dir_result.changed;
     }
@@ -835,7 +868,7 @@ private:
         outcome.success = false;
         continue;
       }
-      auto file_result = download_file_from_providers(task.primary, task.providers, task.dest_relative, quiet);
+      auto file_result = download_file_from_providers(task.primary, task.providers, task.dest_relative, quiet, watch_context);
       outcome.success &= file_result.success;
       outcome.changed |= file_result.changed;
     }
@@ -845,13 +878,17 @@ private:
 
   SyncOutcome sync_directory(const std::string& peer_id,
                              const std::string& remote_path,
+                             const std::string& dir_guid,
                              const std::filesystem::path& dest_root,
-                             bool quiet) {
+                             bool quiet,
+                             const WatchEntry* watch_context) {
     auto entries = blocking_list_peer(peer_id, remote_path, "", "");
     entries.erase(std::remove_if(entries.begin(), entries.end(),
       [](const PeerManager::RemoteListingItem& item){
         return is_internal_listing_path(item.relative_path);
       }), entries.end());
+    notify_untrusted_directory_sources(entries);
+    maybe_warn_duplicate_hashes_for_guid(watch_context, dir_guid, entries);
     if(entries.empty()) {
       ensure_directory_exists(download_root() / dest_root);
       ensure_directory_exists(share_root() / dest_root);
@@ -875,7 +912,20 @@ private:
             pm_->register_directory(sub_string);
           }
         }
-        auto sub_result = sync_directory(item.peer_id, item.relative_path, sub_rel, quiet);
+        auto sub_result = sync_directory(item.peer_id,
+                                         item.relative_path,
+                                         item.directory_guid,
+                                         sub_rel,
+                                         quiet,
+                                         watch_context);
+        if(!item.directory_guid.empty()) {
+          std::string origin_source = !item.origin_peer.empty()
+            ? item.origin_peer
+            : (watch_context && !watch_context->origin_peer.empty() ? watch_context->origin_peer : item.peer_id);
+          if(!origin_source.empty()) {
+            pm_->set_directory_origin(item.directory_guid, origin_source);
+          }
+        }
         outcome.success &= sub_result.success;
         outcome.changed |= sub_result.changed;
       } else {
@@ -891,7 +941,7 @@ private:
         }
         auto sub_rel = dest_root / relative_within(remote_path, item.relative_path);
         sub_rel = sanitize_relative(sub_rel);
-        auto file_result = download_file_from_providers(item, usable, sub_rel, quiet);
+        auto file_result = download_file_from_providers(item, usable, sub_rel, quiet, watch_context);
         outcome.success &= file_result.success;
         outcome.changed |= file_result.changed;
       }
@@ -902,7 +952,8 @@ private:
   SyncOutcome download_file_from_providers(const PeerManager::RemoteListingItem& primary,
                                            const std::vector<PeerManager::RemoteListingItem>& providers,
                                            const std::filesystem::path& dest_relative,
-                                           bool quiet) {
+                                           bool quiet,
+                                           const WatchEntry* watch_context) {
     SyncOutcome outcome;
     if(primary.hash.empty()) {
       outcome.success = false;
@@ -947,40 +998,23 @@ private:
       auto existing_hash = compute_file_hash(final_path);
       if(existing_hash && *existing_hash == primary.hash) {
         return outcome;
-      } else {
-        if(is_conflict_ignored(relative_string, primary.hash, dir_guid)) {
-          if(!quiet) {
-            std::cout << "Destination " << relative_string << " differs but is ignored.\n";
-          }
-        } else {
-          auto origin = primary.peer_id.empty() ? pm_->local_peer_id() : primary.peer_id;
-          add_conflict(relative_string, primary.hash, dir_guid, origin);
-          if(!quiet) {
-            std::cout << "Destination " << relative_string << " already exists with different contents. Added to conflict queue.\n";
-          }
+      }
+      if(is_conflict_ignored(relative_string, primary.hash, dir_guid)) {
+        if(!quiet) {
+          std::cout << "Destination " << relative_string << " differs but is ignored.\n";
         }
-        outcome.success = false;
-        return outcome;
-      }
-    }
-    ensure_directory_exists(staging_path.parent_path());
-    ensure_directory_exists(final_path.parent_path());
-    auto relative_parent = sanitize_relative(final_path.parent_path().lexically_relative(share_root()));
-    auto relative_parent_str = relative_parent.generic_string();
-    if(!relative_parent_str.empty()) {
-      if(!primary.directory_guid.empty()) {
-        pm_->register_directory_with_guid(relative_parent_str, primary.directory_guid);
       } else {
-        pm_->register_directory(relative_parent_str);
+        auto origin = primary.peer_id.empty() ? pm_->local_peer_id() : primary.peer_id;
+        add_conflict(relative_string, primary.hash, dir_guid, origin);
+        if(!quiet) {
+          std::cout << "Destination " << relative_string << " already exists with different contents. Added to conflict queue.\n";
+        }
       }
-    }
-
-    std::ofstream out(staging_path, std::ios::binary | std::ios::trunc);
-    if(!out) {
-      if(!quiet) std::cout << "Cannot open staging file: " << staging_path << "\n";
       outcome.success = false;
       return outcome;
     }
+    ensure_directory_exists(staging_path.parent_path());
+    ensure_directory_exists(final_path.parent_path());
 
     uint64_t file_size = primary.size;
     if(file_size == 0) {
@@ -996,128 +1030,225 @@ private:
       outcome.success = false;
       return outcome;
     }
-    const std::size_t chunk_size = PeerManager::kMaxChunkSize;
-    struct ProviderState {
-      PeerManager::RemoteListingItem item;
-      std::size_t failures = 0;
-    };
-    const std::size_t max_failures_per_peer = 3;
-    std::vector<ProviderState> provider_states;
-    provider_states.reserve(remote_providers.size());
-    for(const auto& provider : remote_providers) {
-      provider_states.push_back(ProviderState{provider, 0});
+
+    auto relative_parent = sanitize_relative(final_path.parent_path().lexically_relative(share_root()));
+    auto relative_parent_str = relative_parent.generic_string();
+    if(!relative_parent_str.empty()) {
+      if(!primary.directory_guid.empty()) {
+        pm_->register_directory_with_guid(relative_parent_str, primary.directory_guid);
+      } else {
+        pm_->register_directory(relative_parent_str);
+      }
+      if(!dir_guid_opt || *dir_guid_opt != primary.directory_guid) {
+        dir_guid_opt = pm_->directory_guid_for_path(relative_parent_str);
+      }
+      if(dir_guid_opt) {
+        std::string origin_source;
+        if(watch_context && !watch_context->origin_peer.empty()) {
+          origin_source = watch_context->origin_peer;
+        } else if(!providers.empty() && !providers.front().peer_id.empty()) {
+          origin_source = providers.front().peer_id;
+        }
+        if(!origin_source.empty()) {
+          pm_->set_directory_origin(*dir_guid_opt, origin_source);
+        }
+      }
     }
 
-    uint64_t offset = 0;
-    std::size_t cursor = 0;
-    while(offset < file_size) {
-      std::size_t request_len = static_cast<std::size_t>(std::min<uint64_t>(chunk_size, file_size - offset));
-      auto active_count = std::count_if(provider_states.begin(), provider_states.end(),
-        [max_failures_per_peer](const ProviderState& state){
-          return state.failures < max_failures_per_peer;
-        });
-      if(active_count == 0) {
-        if(!quiet) std::cout << "\nNo responsive peers remaining for hash " << primary.hash << "\n";
-        out.close();
-        std::error_code ec;
-        std::filesystem::remove(staging_path, ec);
-        outcome.success = false;
-        return outcome;
+    enum class DownloadAttemptResult {
+      Success,
+      HashMismatch,
+      Failed
+    };
+
+    auto attempt_download = [&](const std::vector<PeerManager::RemoteListingItem>& provider_set,
+                                bool quiet_attempt) -> DownloadAttemptResult {
+      if(provider_set.empty()) return DownloadAttemptResult::Failed;
+
+      std::ofstream out(staging_path, std::ios::binary | std::ios::trunc);
+      if(!out) {
+        if(!quiet_attempt) std::cout << "Cannot open staging file: " << staging_path << "\n";
+        return DownloadAttemptResult::Failed;
       }
 
-      bool chunk_ok = false;
-      std::size_t attempts = 0;
-      while(attempts < active_count && !chunk_ok) {
-        ProviderState& state = provider_states[cursor];
-        cursor = (cursor + 1) % provider_states.size();
-        if(state.failures >= max_failures_per_peer) continue;
-        ++attempts;
+      struct ProviderState {
+        PeerManager::RemoteListingItem item;
+        std::size_t failures = 0;
+      };
 
-        auto resp = fetch_chunk(state.item.peer_id, primary.hash, offset, request_len);
-        if(!resp.success || resp.data.empty()) {
-          ++state.failures;
-          if(state.failures == max_failures_per_peer && !quiet) {
-            std::cout << "\nDropping provider " << state.item.peer_id << " after repeated failures.\n";
-          }
-          continue;
-        }
+      std::vector<ProviderState> provider_states;
+      provider_states.reserve(provider_set.size());
+      for(const auto& provider : provider_set) {
+        provider_states.push_back(ProviderState{provider, 0});
+      }
 
-        std::string local_sha = sha256_hex(std::string(resp.data.data(), resp.data.size()));
-        if(!resp.chunk_sha.empty() && resp.chunk_sha != local_sha) {
-          ++state.failures;
-          if(!quiet) {
-            std::cout << "\nHash mismatch; retrying chunk offset "
-                      << offset << " from " << state.item.peer_id << "\n";
-          }
-          if(state.failures == max_failures_per_peer && !quiet) {
-            std::cout << "Dropping provider " << state.item.peer_id << " after repeated checksum errors.\n";
-          }
-          continue;
-        }
+      const std::size_t max_failures_per_peer = 3;
+      const std::size_t chunk_size = PeerManager::kMaxChunkSize;
+      uint64_t offset = 0;
+      std::size_t cursor = 0;
 
-        out.write(resp.data.data(), static_cast<std::streamsize>(resp.data.size()));
-        if(!out) {
-          if(!quiet) std::cout << "\nFailed writing chunk for " << primary.hash << "\n";
+      while(offset < file_size) {
+        std::size_t request_len = static_cast<std::size_t>(std::min<uint64_t>(chunk_size, file_size - offset));
+        auto active_count = std::count_if(provider_states.begin(), provider_states.end(),
+          [max_failures_per_peer](const ProviderState& state){
+            return state.failures < max_failures_per_peer;
+          });
+        if(active_count == 0) {
+          if(!quiet_attempt) std::cout << "\nNo responsive peers remaining for hash " << primary.hash << "\n";
           out.close();
           std::error_code ec;
           std::filesystem::remove(staging_path, ec);
-          outcome.success = false;
-          return outcome;
+          return DownloadAttemptResult::Failed;
         }
 
-        offset += resp.data.size();
-        state.failures = 0;
-        if(!quiet) {
-          double progress = static_cast<double>(offset) / static_cast<double>(file_size) * 100.0;
-          std::cout << "\rSyncing " << primary.hash.substr(0, 8) << "... "
-                    << std::fixed << std::setprecision(1) << progress << "%";
-          std::cout.flush();
+        bool chunk_ok = false;
+        std::size_t attempts = 0;
+        while(attempts < active_count && !chunk_ok) {
+          ProviderState& state = provider_states[cursor];
+          cursor = (cursor + 1) % provider_states.size();
+          if(state.failures >= max_failures_per_peer) continue;
+          ++attempts;
+
+          auto resp = fetch_chunk(state.item.peer_id, primary.hash, offset, request_len);
+          if(!resp.success || resp.data.empty()) {
+            ++state.failures;
+            if(state.failures == max_failures_per_peer && !quiet_attempt) {
+              std::cout << "\nDropping provider " << state.item.peer_id << " after repeated failures.\n";
+            }
+            continue;
+          }
+
+          std::string local_sha = sha256_hex(std::string(resp.data.data(), resp.data.size()));
+          if(!resp.chunk_sha.empty() && resp.chunk_sha != local_sha) {
+            ++state.failures;
+            if(!quiet_attempt) {
+              std::cout << "\nHash mismatch; retrying chunk offset "
+                        << offset << " from " << state.item.peer_id << "\n";
+            }
+            if(state.failures == max_failures_per_peer && !quiet_attempt) {
+              std::cout << "Dropping provider " << state.item.peer_id << " after repeated checksum errors.\n";
+            }
+            continue;
+          }
+
+          out.write(resp.data.data(), static_cast<std::streamsize>(resp.data.size()));
+          if(!out) {
+            if(!quiet_attempt) std::cout << "\nFailed writing chunk for " << primary.hash << "\n";
+            out.close();
+            std::error_code ec;
+            std::filesystem::remove(staging_path, ec);
+            return DownloadAttemptResult::Failed;
+          }
+
+          offset += resp.data.size();
+          state.failures = 0;
+          if(!quiet_attempt) {
+            double progress = static_cast<double>(offset) / static_cast<double>(file_size) * 100.0;
+            std::cout << "\rSyncing " << primary.hash.substr(0, 8) << "... "
+                      << std::fixed << std::setprecision(1) << progress << "%";
+            std::cout.flush();
+          }
+          chunk_ok = true;
         }
-        chunk_ok = true;
+
+        if(!chunk_ok) {
+          if(!quiet_attempt) std::cout << "\nFailed to download chunk for hash " << primary.hash << "\n";
+          out.close();
+          std::error_code ec;
+          std::filesystem::remove(staging_path, ec);
+          return DownloadAttemptResult::Failed;
+        }
       }
 
-      if(!chunk_ok) {
-        if(!quiet) std::cout << "\nFailed to download chunk for hash " << primary.hash << "\n";
-        out.close();
+      if(!quiet_attempt) std::cout << "\n";
+      out.close();
+
+      auto computed_hash = compute_file_hash(staging_path);
+      if(!computed_hash || *computed_hash != primary.hash) {
+        if(!quiet_attempt) std::cout << "File hash mismatch for " << clean_relative << "\n";
         std::error_code ec;
         std::filesystem::remove(staging_path, ec);
-        outcome.success = false;
-        return outcome;
+        return DownloadAttemptResult::HashMismatch;
+      }
+
+      std::error_code ec;
+      std::filesystem::create_directories(final_path.parent_path(), ec);
+      ec.clear();
+      std::filesystem::rename(staging_path, final_path, ec);
+      if(ec) {
+        std::filesystem::copy_file(staging_path, final_path,
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        std::filesystem::remove(staging_path);
+        if(ec) {
+          if(!quiet_attempt) std::cout << "Failed to move downloaded file: " << ec.message() << "\n";
+          return DownloadAttemptResult::Failed;
+        }
+      }
+
+      std::string registered_path = clean_relative.generic_string();
+      pm_->register_local_share(primary.hash, registered_path, final_path, file_size);
+      if(!quiet_attempt) {
+        std::cout << "Synced " << clean_relative << " (" << format_size(file_size) << ")\n";
+      }
+      outcome.changed = true;
+      return DownloadAttemptResult::Success;
+    };
+
+    std::vector<std::vector<PeerManager::RemoteListingItem>> attempt_sets;
+    attempt_sets.push_back(remote_providers);
+    if(watch_context) {
+      std::unordered_set<std::string> trusted_peers;
+      for(const auto& src : watch_context->sources) {
+        trusted_peers.insert(src.peer);
+      }
+      if(!trusted_peers.empty()) {
+        std::vector<PeerManager::RemoteListingItem> trusted_only;
+        for(const auto& provider : remote_providers) {
+          if(trusted_peers.count(provider.peer_id)) {
+            trusted_only.push_back(provider);
+          }
+        }
+        if(!trusted_only.empty() && trusted_only.size() < remote_providers.size()) {
+          attempt_sets.push_back(std::move(trusted_only));
+        }
       }
     }
-    if(!quiet) std::cout << "\n";
-    out.close();
 
-    auto computed_hash = compute_file_hash(staging_path);
-    if(!computed_hash || *computed_hash != primary.hash) {
-      if(!quiet) std::cout << "File hash mismatch for " << clean_relative << "\n";
-      std::error_code ec;
-      std::filesystem::remove(staging_path, ec);
-      outcome.success = false;
+    DownloadAttemptResult final_result = DownloadAttemptResult::Failed;
+    for(size_t i = 0; i < attempt_sets.size(); ++i) {
+      auto result = attempt_download(attempt_sets[i], quiet);
+      final_result = result;
+      if(result == DownloadAttemptResult::Success) {
+        break;
+      }
+      if(result == DownloadAttemptResult::HashMismatch && i + 1 < attempt_sets.size()) {
+        if(!quiet) {
+          std::cout << "Retrying " << clean_relative << " with trusted peers only.\n";
+        }
+        continue;
+      }
+      break;
+    }
+
+    if(final_result == DownloadAttemptResult::Success) {
       return outcome;
     }
 
-    std::error_code ec;
-    std::filesystem::create_directories(final_path.parent_path(), ec);
-    ec.clear();
-    std::filesystem::rename(staging_path, final_path, ec);
-    if(ec) {
-      std::filesystem::copy_file(staging_path, final_path,
-                                 std::filesystem::copy_options::overwrite_existing, ec);
-      std::filesystem::remove(staging_path);
-      if(ec) {
-        if(!quiet) std::cout << "Failed to move downloaded file: " << ec.message() << "\n";
-        outcome.success = false;
-        return outcome;
+    if(final_result == DownloadAttemptResult::HashMismatch) {
+      if(is_conflict_ignored(relative_string, primary.hash, dir_guid)) {
+        if(!quiet) {
+          std::cout << "Destination " << relative_string << " differs but is ignored.\n";
+        }
+      } else {
+        auto origin = primary.peer_id.empty() ? pm_->local_peer_id() : primary.peer_id;
+        add_conflict(relative_string, primary.hash, dir_guid, origin);
+        if(!quiet) {
+          std::cout << "Destination " << relative_string << " already exists with different contents. Added to conflict queue.\n";
+        }
       }
     }
 
-    std::string registered_path = clean_relative.generic_string();
-    pm_->register_local_share(primary.hash, registered_path, final_path, file_size);
-    if(!quiet) {
-      std::cout << "Synced " << clean_relative << " (" << format_size(file_size) << ")\n";
-    }
-    outcome.changed = true;
+    outcome.success = false;
     return outcome;
   }
 
@@ -1223,6 +1354,7 @@ private:
         if(!s.peer.empty()) entry.sources.push_back(std::move(s));
       }
       entry.dir_guid = item.value("dir_guid", "");
+      entry.origin_peer = item.value("origin_peer", "");
       entry.dest_path = normalize_cli_path(item.value("dest", ""));
       entry.dest_is_directory = item.value("dest_is_directory", true);
       auto interval_seconds = item.value("interval", static_cast<int>(default_watch_interval_.count()));
@@ -1233,8 +1365,17 @@ private:
         [&](const WatchEntry::Source& src){ return src.peer.empty() || is_internal_listing_path(src.path); }),
         entry.sources.end());
       if(entry.sources.empty()) continue;
+      if(entry.origin_peer.empty() ||
+         std::none_of(entry.sources.begin(), entry.sources.end(),
+           [&](const WatchEntry::Source& src){ return src.peer == entry.origin_peer; })) {
+        entry.origin_peer = entry.sources.front().peer;
+      }
       if(is_internal_listing_path(entry.dest_path)) continue;
       watches_.push_back(std::move(entry));
+      auto& stored = watches_.back();
+      if(!stored.dir_guid.empty() && !stored.origin_peer.empty()) {
+        pm_->set_directory_origin(stored.dir_guid, stored.origin_peer);
+      }
     }
   }
 
@@ -1255,6 +1396,7 @@ private:
         }
         item["sources"] = std::move(sources);
         if(!entry.dir_guid.empty()) item["dir_guid"] = entry.dir_guid;
+        if(!entry.origin_peer.empty()) item["origin_peer"] = entry.origin_peer;
         if(!entry.dest_path.empty()) item["dest"] = entry.dest_path;
         item["dest_is_directory"] = entry.dest_is_directory;
         item["interval"] = entry.interval.count();
@@ -1283,7 +1425,11 @@ private:
       }
       if(first) std::cout << "(no sources)";
       std::cout << "  dest=" << (entry.dest_path.empty() ? "(default)" : entry.dest_path)
-                << "  every " << entry.interval.count() << "s\n";
+                << "  every " << entry.interval.count() << "s";
+      if(!entry.origin_peer.empty()) {
+        std::cout << "  origin=" << entry.origin_peer;
+      }
+      std::cout << "\n";
     }
   }
 
@@ -1344,41 +1490,137 @@ private:
       return outcome;
     }
 
-    const auto& source = entry.sources.front();
-    if(source.peer.empty()) {
+    WatchEntry current = entry;
+    if(current.origin_peer.empty() && !current.sources.empty()) {
+      current.origin_peer = current.sources.front().peer;
+    }
+    if(current.dir_guid.empty()) {
+      for(const auto& src : current.sources) {
+        if(src.peer.empty()) continue;
+        if(src.peer == pm_->local_peer_id()) continue;
+        if(src.path.empty()) continue;
+        auto resolved = resolve_remote_dir_guid(src.peer, src.path);
+        if(resolved) {
+          current.dir_guid = resolved->guid;
+          if(!resolved->origin_peer.empty()) {
+            current.origin_peer = resolved->origin_peer;
+          }
+          {
+            std::lock_guard<std::mutex> lock(watch_mutex_);
+            auto* stored = find_watch_by_id(current.id);
+            if(stored) {
+              if(stored->dir_guid.empty()) {
+                stored->dir_guid = current.dir_guid;
+              }
+              if(!current.origin_peer.empty()) {
+                stored->origin_peer = current.origin_peer;
+              } else if(stored->origin_peer.empty() && !stored->sources.empty()) {
+                stored->origin_peer = stored->sources.front().peer;
+              }
+            }
+          }
+          if(!current.dir_guid.empty() && !current.origin_peer.empty()) {
+            pm_->set_directory_origin(current.dir_guid, current.origin_peer);
+          }
+          break;
+        }
+      }
+    }
+
+    std::vector<const WatchEntry::Source*> ordered_sources;
+    auto is_origin = [&](const WatchEntry::Source& src){
+      return !current.origin_peer.empty() && src.peer == current.origin_peer;
+    };
+    if(!current.origin_peer.empty()) {
+      for(const auto& src : current.sources) {
+        if(is_origin(src)) {
+          ordered_sources.push_back(&src);
+          break;
+        }
+      }
+    }
+    for(const auto& src : current.sources) {
+      if(current.origin_peer.empty() || !is_origin(src)) {
+        ordered_sources.push_back(&src);
+      }
+    }
+
+    std::vector<PeerManager::RemoteListingItem> collected;
+    std::optional<ListCommand> selected;
+
+    for(const auto* source_ptr : ordered_sources) {
+      const auto& source = *source_ptr;
+      if(source.peer.empty()) continue;
+      if(source.peer == pm_->local_peer_id()) continue;
+
+      ListCommand candidate;
+      if(!current.dir_guid.empty()) {
+        candidate.type = ListCommand::Type::RemoteDirectoryGuid;
+        candidate.peer = source.peer;
+        candidate.dir_guid = current.dir_guid;
+      } else if(!source.path.empty()) {
+        candidate.type = ListCommand::Type::RemotePath;
+        candidate.peer = source.peer;
+        candidate.path = source.path;
+      } else {
+        continue;
+      }
+
+      auto entries = blocking_list_peer(candidate.peer,
+                                        current.dir_guid.empty() ? candidate.path : "",
+                                        "",
+                                        current.dir_guid);
+      entries.erase(std::remove_if(entries.begin(), entries.end(),
+        [](const PeerManager::RemoteListingItem& item){
+          return is_internal_listing_path(item.relative_path);
+        }), entries.end());
+
+      notify_untrusted_directory_sources(entries);
+
+      if(!selected) {
+        selected = candidate;
+        collected = entries;
+      } else if(collected.empty() && !entries.empty()) {
+        selected = candidate;
+        collected = entries;
+      }
+
+      if(!collected.empty()) break;
+    }
+
+    if(!selected) {
       outcome.success = false;
       return outcome;
     }
 
-    if(source.peer == pm_->local_peer_id()) {
-      return outcome;
+    std::optional<std::string> remote_root_origin;
+    for(const auto& item : collected) {
+      if(item.is_directory && item.relative_path.empty() && !item.origin_peer.empty()) {
+        remote_root_origin = item.origin_peer;
+        break;
+      }
     }
-
-    ListCommand cmd;
-    if(!entry.dir_guid.empty()) {
-      cmd.type = ListCommand::Type::RemoteDirectoryGuid;
-      cmd.peer = source.peer;
-      cmd.dir_guid = entry.dir_guid;
-    } else {
-      cmd.type = ListCommand::Type::RemotePath;
-      cmd.peer = source.peer;
-      cmd.path = source.path;
+    if(remote_root_origin && !remote_root_origin->empty()) {
+      current.origin_peer = *remote_root_origin;
+      {
+        std::lock_guard<std::mutex> lock(watch_mutex_);
+        auto* stored = find_watch_by_id(current.id);
+        if(stored) {
+          stored->origin_peer = current.origin_peer;
+        }
+      }
+      if(!current.dir_guid.empty()) {
+        pm_->set_directory_origin(current.dir_guid, current.origin_peer);
+      }
     }
-
-    auto entries = blocking_list_peer(source.peer,
-                                      entry.dir_guid.empty() ? source.path : "",
-                                      "",
-                                      entry.dir_guid);
-    entries.erase(std::remove_if(entries.begin(), entries.end(),
+    collected.erase(std::remove_if(collected.begin(), collected.end(),
       [](const PeerManager::RemoteListingItem& item){
-        return is_internal_listing_path(item.relative_path);
-      }), entries.end());
-    if(entries.empty()) {
-      return outcome;
-    }
+        return item.is_directory && item.relative_path.empty();
+      }), collected.end());
+
     std::optional<std::string> dest;
-    if(!entry.dest_path.empty()) dest = entry.dest_path;
-    outcome = perform_sync(cmd, std::move(entries), dest, entry.dest_is_directory, false);
+    if(!current.dest_path.empty()) dest = current.dest_path;
+    outcome = perform_sync(*selected, std::move(collected), dest, current.dest_is_directory, false, &current);
     return outcome;
   }
 
@@ -1414,6 +1656,104 @@ private:
       if(entry.id == id) return &entry;
     }
     return nullptr;
+  }
+
+  std::optional<ResolvedDirGuid> resolve_remote_dir_guid(const std::string& peer,
+                                                         const std::string& path) {
+    auto normalized = normalize_cli_path(path);
+    if(normalized.empty()) return std::nullopt;
+    std::filesystem::path p(normalized);
+    auto parent = normalize_cli_path(p.parent_path().generic_string());
+    auto listings = blocking_list_peer(peer, parent, "", "");
+    listings.erase(std::remove_if(listings.begin(), listings.end(),
+      [](const PeerManager::RemoteListingItem& item){
+        return is_internal_listing_path(item.relative_path);
+      }), listings.end());
+    notify_untrusted_directory_sources(listings);
+    for(const auto& item : listings) {
+      if(!item.is_directory) continue;
+      if(item.directory_guid.empty()) continue;
+      auto candidate = normalize_cli_path(item.relative_path);
+      if(candidate == normalized) {
+        ResolvedDirGuid resolved;
+        resolved.guid = item.directory_guid;
+        resolved.origin_peer = item.origin_peer.empty() ? peer : item.origin_peer;
+        return resolved;
+      }
+    }
+    return std::nullopt;
+  }
+
+  void notify_untrusted_directory_sources(const std::vector<PeerManager::RemoteListingItem>& entries) {
+    struct Notice {
+      std::string watch_id;
+      std::string peer;
+      std::string guid;
+      std::string path;
+    };
+
+    std::vector<Notice> notices;
+    {
+      std::lock_guard<std::mutex> lock(watch_mutex_);
+      for(const auto& item : entries) {
+      if(!item.is_directory) continue;
+      if(item.directory_guid.empty()) continue;
+      if(item.relative_path.empty()) continue;
+      if(item.peer_id.empty()) continue;
+        auto* watch = find_watch_by_guid(item.directory_guid);
+        if(!watch) continue;
+        auto trusted = std::any_of(watch->sources.begin(), watch->sources.end(),
+          [&](const WatchEntry::Source& src){
+            return src.peer == item.peer_id;
+          });
+        if(trusted) continue;
+        notices.push_back(Notice{watch->id, item.peer_id, item.directory_guid, item.relative_path});
+      }
+    }
+
+    for(const auto& note : notices) {
+      std::cout << "[watch " << note.watch_id << "] Peer " << note.peer
+                << " advertises " << note.guid;
+      if(!note.path.empty()) {
+        std::cout << " (" << note.path << ")";
+      }
+      std::cout << ". Use 'watch add " << note.peer << ":/" << note.guid
+                << "' to trust that source.\n";
+    }
+  }
+
+  void maybe_warn_duplicate_hashes_for_guid(const WatchEntry* watch,
+                                            const std::string& guid,
+                                            const std::vector<PeerManager::RemoteListingItem>& entries) {
+    if(!watch) return;
+    std::string effective_guid = guid.empty() ? watch->dir_guid : guid;
+    if(effective_guid.empty()) return;
+
+    std::unordered_map<std::string, std::vector<std::string>> per_hash;
+    for(const auto& item : entries) {
+      if(item.is_directory) continue;
+      if(item.hash.empty()) continue;
+      auto normalized = normalize_cli_path(item.relative_path);
+      if(normalized.empty()) normalized = item.relative_path;
+      if(normalized.empty()) normalized = "(root)";
+      per_hash[item.hash].push_back(normalized);
+    }
+
+    for(auto& [hash, paths] : per_hash) {
+      std::sort(paths.begin(), paths.end());
+      paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
+      if(paths.size() <= 1) continue;
+
+      std::cout << "[watch " << watch->id << "] hash " << hash.substr(0, 8)
+                << " is advertised at multiple paths under " << effective_guid << ": ";
+      bool first = true;
+      for(const auto& path : paths) {
+        if(!first) std::cout << ", ";
+        first = false;
+        std::cout << path;
+      }
+      std::cout << ". Review before accepting duplicates.\n";
+    }
   }
 
   void handle_watch_command(const std::string& args) {
@@ -1472,64 +1812,256 @@ private:
         return;
       }
 
-      WatchEntry entry;
-      entry.id = generate_watch_id();
-      entry.source_peer = parsed->peer;
-      entry.source_path = parsed->path;
-      entry.source_dir_guid = parsed->dir_guid;
-      entry.dest_path = dest_override ? *dest_override : "";
-      entry.dest_is_directory = dest_is_dir || entry.dest_path.empty();
-      entry.interval = default_watch_interval_;
-      entry.next_run = std::chrono::steady_clock::now() + entry.interval;
+      WatchEntry::Source new_source;
+      new_source.peer = parsed->peer;
+      if(parsed->type == ListCommand::Type::RemotePath) {
+        new_source.path = normalize_cli_path(parsed->path);
+      } else {
+        new_source.path.clear();
+      }
+
+      std::optional<ResolvedDirGuid> resolved_guid;
+      if(parsed->type == ListCommand::Type::RemoteDirectoryGuid) {
+        resolved_guid = ResolvedDirGuid{parsed->dir_guid, new_source.peer};
+      } else {
+        resolved_guid = resolve_remote_dir_guid(parsed->peer, new_source.path);
+        if(!resolved_guid) {
+          std::cout << "Unable to determine directory GUID for " << parsed->peer << ":/" << parsed->path << ".\n";
+          std::cout << "Ensure the directory exists and has been indexed on the remote peer.\n";
+          return;
+        }
+      }
+
+      if(resolved_guid->guid.empty()) {
+        std::cout << "Directory GUID is required to track a watch.\n";
+        return;
+      }
+
+      WatchEntry snapshot;
+      bool created = false;
+      bool updated = false;
+      std::string affected_id;
 
       {
         std::lock_guard<std::mutex> lock(watch_mutex_);
-        auto duplicate = std::find_if(watches_.begin(), watches_.end(),
-          [&](const WatchEntry& existing){
-            return existing.source_peer == entry.source_peer &&
-                   existing.source_dir_guid == entry.source_dir_guid &&
-                   existing.source_path == entry.source_path &&
-                   existing.dest_path == entry.dest_path &&
-                   existing.dest_is_directory == entry.dest_is_directory;
-          });
-        if(duplicate != watches_.end()) {
-          std::cout << "Watch already exists with id " << duplicate->id << "\n";
-          return;
+        WatchEntry* existing = find_watch_by_guid(resolved_guid->guid);
+        if(!existing) {
+          WatchEntry fresh;
+          fresh.id = generate_watch_id();
+          fresh.dir_guid = resolved_guid->guid;
+          fresh.origin_peer = !resolved_guid->origin_peer.empty() ? resolved_guid->origin_peer : new_source.peer;
+          fresh.dest_path = dest_override ? *dest_override : "";
+          fresh.dest_is_directory = dest_is_dir || fresh.dest_path.empty();
+          fresh.interval = default_watch_interval_;
+          fresh.next_run = std::chrono::steady_clock::now() + fresh.interval;
+          fresh.sources.push_back(new_source);
+          watches_.push_back(fresh);
+          snapshot = watches_.back();
+          affected_id = snapshot.id;
+          created = true;
+          updated = true;
+          if(!fresh.dir_guid.empty() && !fresh.origin_peer.empty()) {
+            pm_->set_directory_origin(fresh.dir_guid, fresh.origin_peer);
+          }
+        } else {
+          affected_id = existing->id;
+          if(dest_override) {
+            if(existing->dest_path.empty()) {
+              existing->dest_path = *dest_override;
+              existing->dest_is_directory = dest_is_dir || existing->dest_path.empty();
+            } else if(existing->dest_path != *dest_override) {
+              std::cout << "Watch " << existing->id << " already uses destination "
+                        << existing->dest_path << ". Remove it first to change destinations.\n";
+              return;
+            }
+          }
+          auto dup = std::find_if(existing->sources.begin(), existing->sources.end(),
+            [&](const WatchEntry::Source& src){
+              return src.peer == new_source.peer &&
+                     normalize_cli_path(src.path) == normalize_cli_path(new_source.path);
+            });
+          if(dup != existing->sources.end()) {
+            std::cout << "Watch " << existing->id << " already trusts " << new_source.peer;
+            if(!new_source.path.empty()) std::cout << ":/" << new_source.path;
+            std::cout << ".\n";
+            return;
+          }
+          existing->sources.push_back(new_source);
+          existing->next_run = std::chrono::steady_clock::now();
+          if(resolved_guid && existing->dir_guid.empty()) {
+            existing->dir_guid = resolved_guid->guid;
+          }
+          if(resolved_guid && !resolved_guid->origin_peer.empty()) {
+            existing->origin_peer = resolved_guid->origin_peer;
+          } else if(existing->origin_peer.empty()) {
+            existing->origin_peer = existing->sources.front().peer;
+          }
+          if(!existing->dir_guid.empty() && !existing->origin_peer.empty()) {
+            pm_->set_directory_origin(existing->dir_guid, existing->origin_peer);
+          }
+          snapshot = *existing;
+          updated = true;
         }
-        watches_.push_back(entry);
       }
+
+      if(!updated) return;
+
+      if(!snapshot.dir_guid.empty()) {
+        std::string local_root;
+        if(!snapshot.dest_path.empty()) {
+          local_root = snapshot.dest_path;
+        } else if(!snapshot.sources.empty() && !snapshot.sources.front().path.empty()) {
+          local_root = snapshot.sources.front().path;
+        }
+        if(!local_root.empty()) {
+          pm_->register_directory_with_guid(local_root, snapshot.dir_guid);
+        }
+        if(!snapshot.origin_peer.empty()) {
+          pm_->set_directory_origin(snapshot.dir_guid, snapshot.origin_peer);
+        }
+      }
+
       save_watches();
       watch_cv_.notify_all();
-      std::cout << "Added watch " << entry.id << "\n";
-      auto result = run_single_watch(entry);
+      if(created) {
+        std::cout << "Added watch " << affected_id << " for " << resolved_guid->guid << ".\n";
+      } else {
+        std::cout << "Updated watch " << affected_id << " with a new trusted source.\n";
+      }
+      auto result = run_single_watch(snapshot);
       if(!result.success) {
-        std::cout << "[watch " << entry.id << "] sync failed.\n";
+        std::cout << "[watch " << affected_id << "] sync failed.\n";
       } else if(result.changed) {
-        std::cout << "[watch " << entry.id << "] synced.\n";
+        std::cout << "[watch " << affected_id << "] synced.\n";
       }
     } else if(action == "remove") {
       std::string id;
       iss >> id;
+      trim(id);
       if(id.empty()) {
-        std::cout << "Usage: watch remove <id>\n";
+        std::cout << "Usage: watch remove <id|dir-guid|peer:/path>\n";
         return;
       }
-      bool removed = false;
-      {
-        std::lock_guard<std::mutex> lock(watch_mutex_);
-        auto it = std::remove_if(watches_.begin(), watches_.end(),
-                                 [&](const WatchEntry& entry){ return entry.id == id; });
-        if(it != watches_.end()) {
-          watches_.erase(it, watches_.end());
-          removed = true;
+
+      bool changed = false;
+      bool removed_watch = false;
+      std::vector<std::string> removed_ids;
+
+      if(id.find(':') != std::string::npos) {
+        auto parsed = parse_list_command(id);
+        if(!parsed || (parsed->type != ListCommand::Type::RemotePath && parsed->type != ListCommand::Type::RemoteDirectoryGuid)) {
+          std::cout << "Specify a watch source as peer:/path or peer:dir-guid.\n";
+          return;
         }
-      }
-      if(removed) {
+
+        std::string normalized_path = parsed->type == ListCommand::Type::RemotePath
+          ? normalize_cli_path(parsed->path)
+          : "";
+
+        {
+          std::lock_guard<std::mutex> lock(watch_mutex_);
+          for(auto it = watches_.begin(); it != watches_.end();) {
+            bool modified = false;
+            if(parsed->type == ListCommand::Type::RemoteDirectoryGuid) {
+              if(it->dir_guid != parsed->dir_guid) {
+                ++it;
+                continue;
+              }
+              auto before = it->sources.size();
+              it->sources.erase(std::remove_if(it->sources.begin(), it->sources.end(),
+                [&](const WatchEntry::Source& src){
+                  return src.peer == parsed->peer;
+                }), it->sources.end());
+              modified = before != it->sources.size();
+              if(modified && !it->sources.empty()) {
+                auto origin_found = std::find_if(it->sources.begin(), it->sources.end(),
+                  [&](const WatchEntry::Source& src){
+                    return src.peer == it->origin_peer;
+                  });
+                if(origin_found == it->sources.end()) {
+                  it->origin_peer = it->sources.front().peer;
+                }
+                if(!it->dir_guid.empty() && !it->origin_peer.empty()) {
+                  pm_->set_directory_origin(it->dir_guid, it->origin_peer);
+                }
+              }
+            } else {
+              auto before = it->sources.size();
+              it->sources.erase(std::remove_if(it->sources.begin(), it->sources.end(),
+                [&](const WatchEntry::Source& src){
+                  return src.peer == parsed->peer &&
+                         normalize_cli_path(src.path) == normalized_path;
+                }), it->sources.end());
+              modified = before != it->sources.size();
+              if(modified && !it->sources.empty()) {
+                auto origin_found = std::find_if(it->sources.begin(), it->sources.end(),
+                  [&](const WatchEntry::Source& src){
+                    return src.peer == it->origin_peer;
+                  });
+                if(origin_found == it->sources.end()) {
+                  it->origin_peer = it->sources.front().peer;
+                }
+                if(!it->dir_guid.empty() && !it->origin_peer.empty()) {
+                  pm_->set_directory_origin(it->dir_guid, it->origin_peer);
+                }
+              }
+            }
+
+            if(modified) {
+              changed = true;
+              if(it->sources.empty()) {
+                removed_ids.push_back(it->id);
+                it = watches_.erase(it);
+                removed_watch = true;
+                continue;
+              }
+            }
+            ++it;
+          }
+        }
+
+        if(!changed && !removed_watch) {
+          std::cout << "No matching watch source found.\n";
+          return;
+        }
+
         save_watches();
         watch_cv_.notify_all();
-        std::cout << "Removed watch " << id << "\n";
+        if(!removed_ids.empty()) {
+          for(const auto& rid : removed_ids) {
+            std::cout << "Removed watch " << rid << "\n";
+          }
+        } else {
+          std::cout << "Removed source from watch.\n";
+        }
       } else {
-        std::cout << "No watch found with id " << id << "\n";
+        bool treat_as_guid = looks_like_dir_guid(id);
+        {
+          std::lock_guard<std::mutex> lock(watch_mutex_);
+          auto matcher = [&](const WatchEntry& entry){
+            return treat_as_guid ? entry.dir_guid == id : entry.id == id;
+          };
+          auto it = std::remove_if(watches_.begin(), watches_.end(), matcher);
+          if(it != watches_.end()) {
+            for(auto iter = it; iter != watches_.end(); ++iter) {
+              removed_ids.push_back(iter->id);
+            }
+            watches_.erase(it, watches_.end());
+            changed = true;
+            removed_watch = true;
+          }
+        }
+
+        if(!changed) {
+          std::cout << "No watch found with that identifier.\n";
+          return;
+        }
+
+        save_watches();
+        watch_cv_.notify_all();
+        for(const auto& rid : removed_ids) {
+          std::cout << "Removed watch " << rid << "\n";
+        }
       }
     } else if(action == "interval") {
       std::string value;
@@ -2035,7 +2567,7 @@ private:
     auto final_path = share_root() / dest_relative;
     archive_existing_file(final_path, dest_relative);
 
-    auto outcome = download_file_from_providers(primary, providers, dest_relative, false);
+    auto outcome = download_file_from_providers(primary, providers, dest_relative, false, nullptr);
     if(!outcome.success) {
       std::cout << "Failed to download " << conflict.relative_path << ".\n";
       return false;

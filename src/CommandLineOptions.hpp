@@ -193,7 +193,7 @@ inline void CommandLineOptions::usage() const {
       aliases << " (alias: ";
       for(std::size_t i = 0; i < spec.aliases.size(); ++i) {
         if(i > 0) aliases << ", ";
-        aliases << "--" << spec.aliases[i];
+        aliases << "-" << spec.aliases[i];
       }
       aliases << ")";
     }
@@ -211,14 +211,17 @@ inline void CommandLineOptions::parse_args(int argc, char* argv[]) {
   const std::vector<std::string> args(argv + 1, argv + argc);
   std::size_t positional_index = 0;
 
+  auto is_option_token = [](const std::string& candidate) {
+    if(candidate.rfind("--", 0) == 0) return true;
+    if(candidate.size() >= 2 && candidate[0] == '-' &&
+       std::isalpha(static_cast<unsigned char>(candidate[1]))) {
+      return true;
+    }
+    return false;
+  };
+
   for(std::size_t i = 0; i < args.size(); ++i) {
     const std::string& token = args[i];
-
-    if(token == "-h" || token == "-?") {
-      std::string error;
-      set_from_string("help", "true", error);
-      continue;
-    }
 
     if(token.rfind("--", 0) == 0) {
       std::string key_token = token.substr(2);
@@ -231,7 +234,7 @@ inline void CommandLineOptions::parse_args(int argc, char* argv[]) {
 
       std::string value;
       if(spec->type == "bool") {
-        if(i + 1 < args.size() && args[i + 1].rfind("--", 0) != 0) {
+        if(i + 1 < args.size() && !is_option_token(args[i + 1])) {
           value = args[++i];
         } else {
           value = "true";
@@ -252,6 +255,42 @@ inline void CommandLineOptions::parse_args(int argc, char* argv[]) {
         std::exit(1);
       }
       continue;
+    }
+
+    if(token.size() > 1 && token[0] == '-' && token[1] != '-') {
+      std::string alias_token = token.substr(1);
+      const auto* spec = find_spec(alias_token);
+      bool is_alias = false;
+      if(spec) {
+        std::string lowered_alias = to_lower(alias_token);
+        is_alias = std::find(spec->aliases.begin(), spec->aliases.end(), lowered_alias) != spec->aliases.end();
+      }
+      if(spec && is_alias) {
+        std::string value;
+        if(spec->type == "bool") {
+          if(i + 1 < args.size() && !is_option_token(args[i + 1])) {
+            value = args[++i];
+          } else {
+            value = "true";
+          }
+        } else {
+          if(i + 1 >= args.size()) {
+            print_err("Missing value for -{}", alias_token);
+            usage();
+            std::exit(1);
+          }
+          value = args[++i];
+        }
+
+        std::string error;
+        if(!set_from_string(spec->key, value, error)) {
+          print_err("Invalid value for -{}: {}", alias_token, error);
+          usage();
+          std::exit(1);
+        }
+        continue;
+      }
+      // Not a recognised alias; fall through to positional handling.
     }
 
     if(positional_index >= argv_specs().size()) {
