@@ -18,14 +18,14 @@ tell application "Terminal"
     set newTab to do script "cd \"$SYNC_DIR\"; $CMD; exit"
 
     -- Let Terminal actually create the window
-    delay 0.4
+    delay 0.25
 
     set w to front window
     set number of columns of w to ${TERMINAL_COLUMNS}
     set number of rows of w to ${TERMINAL_ROWS}
 
     -- Make sure Terminal recalculates the pixel geometry
-    delay 0.25
+    delay 0.1
 
     -- Read the actual size Terminal computed
     set {x1, y1, x2, y2} to bounds of w
