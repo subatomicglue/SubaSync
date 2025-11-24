@@ -63,6 +63,7 @@ public:
     apply_setting_side_effects("progress_meter_size");
     apply_setting_side_effects("swarm_max_parallel");
     apply_setting_side_effects("swarm_chunk_buffers");
+    apply_setting_side_effects("swarm_chunk_size");
     apply_setting_side_effects("swarm_progress_interval_ms");
     pm_->set_listing_refresh_callback([this](){
       index_share_root();
@@ -117,6 +118,7 @@ private:
   std::size_t progress_meter_size_ = 80;
   std::size_t swarm_max_parallel_ = 0;
   std::size_t swarm_chunk_buffers_ = 1;
+  std::size_t swarm_chunk_size_ = PeerManager::kMaxChunkSize;
   std::chrono::milliseconds swarm_progress_interval_{200};
   std::chrono::milliseconds swarm_provider_refresh_interval_{2000};
   std::chrono::milliseconds chunk_timeout_{10000};
@@ -1377,7 +1379,7 @@ private:
       return outcome;
     }
 
-    const std::size_t chunk_size = PeerManager::kMaxChunkSize;
+    const std::size_t chunk_size = current_chunk_size();
     const std::size_t total_chunks = static_cast<std::size_t>((file_size + chunk_size - 1) / chunk_size);
     std::vector<uint8_t> chunk_states(total_chunks, 0);
     const bool enable_meter = transfer_progress_enabled_ && !quiet && total_chunks > 0;
@@ -2578,6 +2580,10 @@ private:
     return oss.str();
   }
 
+  std::size_t current_chunk_size() const {
+    return std::clamp<std::size_t>(swarm_chunk_size_, 4096, PeerManager::kMaxChunkSize);
+  }
+
   static std::string format_duration_compact(std::chrono::steady_clock::duration elapsed) {
     double seconds = std::chrono::duration<double>(elapsed).count();
     double value = seconds;
@@ -3296,6 +3302,7 @@ private:
         apply_setting_side_effects("progress_meter_size");
         apply_setting_side_effects("swarm_max_parallel");
         apply_setting_side_effects("swarm_chunk_buffers");
+        apply_setting_side_effects("swarm_chunk_size");
         apply_setting_side_effects("swarm_progress_interval_ms");
         std::cout << "Loaded settings from " << settings_->settings_path() << "\n";
       } else {
@@ -3360,6 +3367,15 @@ private:
         int value = settings_->get<int>("swarm_chunk_buffers");
         if(value < 1) value = 1;
         swarm_chunk_buffers_ = static_cast<std::size_t>(value);
+      } catch(...) {
+        // ignore
+      }
+    } else if(key == "swarm_chunk_size") {
+      try {
+        int value = settings_->get<int>("swarm_chunk_size");
+        if(value <= 0) value = static_cast<int>(PeerManager::kMaxChunkSize);
+        int clamped = std::clamp(value, 4096, static_cast<int>(PeerManager::kMaxChunkSize));
+        swarm_chunk_size_ = static_cast<std::size_t>(clamped);
       } catch(...) {
         // ignore
       }
@@ -4164,7 +4180,7 @@ private:
       out.seekp(0);
     }
 
-    const std::size_t chunk_size = PeerManager::kMaxChunkSize;
+    const std::size_t chunk_size = current_chunk_size();
     const std::size_t total_chunks = static_cast<std::size_t>((file_size + chunk_size - 1) / chunk_size);
     std::vector<uint8_t> chunk_states(total_chunks, 0);
     const bool enable_meter = transfer_progress_enabled_ && !quiet && total_chunks > 0;
