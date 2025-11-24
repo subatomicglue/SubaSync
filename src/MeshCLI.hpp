@@ -270,7 +270,7 @@ private:
         std::getline(iss, path);
         trim(path);
         share_command(path);
-      } else if(cmd == "sync" || cmd == "get") {
+      } else if(cmd == "sync") {
         std::string target;
         std::getline(iss, target);
         trim(target);
@@ -297,7 +297,26 @@ private:
         std::string args;
         std::getline(iss, args);
         trim(args);
+        if(args.empty()) args = "list";
         handle_settings_command(args);
+      } else if(cmd == "set") {
+        std::string args;
+        std::getline(iss, args);
+        trim(args);
+        if(args.empty()) {
+          handle_settings_command("list");
+        } else {
+          handle_settings_command("set " + args);
+        }
+      } else if(cmd == "get") {
+        std::string args;
+        std::getline(iss, args);
+        trim(args);
+        handle_settings_command(args.empty() ? "get" : "get " + args);
+      } else if(cmd == "save") {
+        handle_settings_command("save");
+      } else if(cmd == "load") {
+        handle_settings_command("load");
       } else if(cmd == "ignore") {
         std::string args;
         std::getline(iss, args);
@@ -4435,6 +4454,10 @@ private:
     std::cout << "  sync force <resource>             Delete local copy before syncing\n";
     std::cout << "  watch [list|add|remove|set|interval]  Manage directory watches\n";
     std::cout << "  settings [list|get|set|save|load] Manage runtime settings\n";
+    std::cout << "  set [key value]                   Shortcut for settings set (lists when empty)\n";
+    std::cout << "  get <key>                         Shortcut for settings get\n";
+    std::cout << "  save                              Shortcut for settings save\n";
+    std::cout << "  load                              Shortcut for settings load\n";
     std::cout << "  ignore [list|add|remove]          Manage persistent ignore rules\n";
     std::cout << "  guid list                        Show all tracked directory GUIDs\n";
     std::cout << "  guid orphans                     Show GUIDs whose directories are missing\n";
