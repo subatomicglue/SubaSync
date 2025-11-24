@@ -24,7 +24,9 @@ inline const nlohmann::json SETTINGS_SPECIFICATION = nlohmann::json::array({
   {{"key","external_port"},       {"aliases", {"ep"}},             {"type","int"},    {"default",0},         {"description","External port advertised to peers"}, {"persistent", true}},
   {{"key","audio_notifications"}, {"aliases", {"audio","bell"}},   {"type","bool"},   {"default",false},     {"description","Play terminal bell on chat messages"}, {"persistent", true}},
   {{"key","verbose"},             {"aliases", {"v"}},              {"type","bool"},   {"default",false},     {"description","Enable verbose logging"}, {"persistent", true}},
-  {{"key","transfer_debug"},      {"aliases", {"transfer","td"}},  {"type","bool"},   {"default",false},     {"description","Log file chunk send/receive activity"}, {"persistent", true}},
+  {{"key","transfer_debug"},      {"aliases", {"transfer","td"}},  {"type","bool"},   {"default",false},     {"description","Log chunk send/receive activity"}, {"persistent", true}},
+  {{"key","transfer_progress"},   {"aliases", {"progress","tp"}}, {"type","bool"},   {"default",true},      {"description","Show ASCII progress meter during downloads"}, {"persistent", true}},
+  {{"key","progress_meter_size"}, {"aliases", {"meter","meter_size","pms"}}, {"type","int"}, {"default",80}, {"description","Number of characters used for the transfer progress meter"}, {"persistent", true}},
   {{"key","help"},                {"aliases", {"h","?"}},          {"type","bool"},   {"default",false},     {"description","Show command help and exit"}, {"persistent", false}},
   {{"key","save"},                {"aliases", {"persist"}},        {"type","bool"},   {"default",false},     {"description","Persist current settings to disk"}, {"persistent", false}}
 });
@@ -331,7 +333,7 @@ inline std::string SettingsManager::value_as_string(const std::string& key) cons
 }
 
 inline std::filesystem::path SettingsManager::settings_path() const {
-  return std::filesystem::current_path() / "share" / ".config" / "settings.json";
+  return std::filesystem::current_path() / ".config" / "settings.json";
 }
 
 inline bool SettingsManager::load() {

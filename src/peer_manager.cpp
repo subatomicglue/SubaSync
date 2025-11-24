@@ -735,20 +735,26 @@ void PeerManager::handle_list_request(const std::string& peer_id,
       items.push_back(std::move(item));
     }
   } else if(!dir_guid.empty()){
-    items = local_listing_for_dir_guid(dir_guid);
-    RemoteListingItem root;
-    root.peer_id = local_peer_id_;
-    root.hash.clear();
-    root.relative_path.clear();
-    root.size = 0;
-    root.is_directory = true;
-    root.directory_guid = dir_guid;
-    if(auto origin = directory_origin(dir_guid)) {
-      root.origin_peer = *origin;
+    auto resolved = resolve_directory_guid(dir_guid);
+    if(resolved){
+      items = local_listing_items_for_path(*resolved);
+      RemoteListingItem root;
+      root.peer_id = local_peer_id_;
+      root.hash.clear();
+      root.relative_path.clear();
+      root.size = 0;
+      root.is_directory = true;
+      root.directory_guid = dir_guid;
+      root.listing_root_path = *resolved;
+      if(auto origin = directory_origin(dir_guid)) {
+        root.origin_peer = *origin;
+      } else {
+        root.origin_peer = local_peer_id_;
+      }
+      items.insert(items.begin(), root);
     } else {
-      root.origin_peer = local_peer_id_;
+      items.clear();
     }
-    items.insert(items.begin(), root);
   } else {
     items = local_listing_items_for_path(relative_path);
   }
@@ -762,6 +768,7 @@ void PeerManager::handle_list_request(const std::string& peer_id,
     item["is_dir"] = entry.is_directory;
     if(!entry.directory_guid.empty()) item["dir_guid"] = entry.directory_guid;
     if(!entry.origin_peer.empty()) item["origin"] = entry.origin_peer;
+    if(!entry.listing_root_path.empty()) item["root_path"] = entry.listing_root_path;
     arr.push_back(item);
   }
   resp["entries"] = arr;
@@ -859,6 +866,7 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
         item.is_directory = entry.value("is_dir", false);
         item.directory_guid = entry.value("dir_guid", "");
         item.origin_peer = entry.value("origin", "");
+        item.listing_root_path = entry.value("root_path", "");
         items.push_back(std::move(item));
       }
     }

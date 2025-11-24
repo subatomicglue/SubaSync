@@ -4,15 +4,18 @@ release: ./build/Release/sync
 debug: ./build/Debug/sync
 
 establish_dirs:
-	rm -rf build/Release/sandbox1 && mkdir -p build/Release/sandbox1/share/.config
-	rm -rf build/Release/sandbox2 && mkdir -p build/Release/sandbox2/share/.config
-	rm -rf build/Release/sandbox3 && mkdir -p build/Release/sandbox3/share/.config
-	ln -s `pwd`/sandbox1-settings.json build/Release/sandbox1/share/.config/settings.json
-	ln -s `pwd`/sandbox2-settings.json build/Release/sandbox2/share/.config/settings.json
-	ln -s `pwd`/sandbox3-settings.json build/Release/sandbox3/share/.config/settings.json
-	ln -s `pwd`/sandbox1-watches.json build/Release/sandbox1/watches.json
-	ln -s `pwd`/sandbox2-watches.json build/Release/sandbox2/watches.json
-	ln -s `pwd`/sandbox3-watches.json build/Release/sandbox3/watches.json
+	rm -rf build/Release/sandbox1 && mkdir -p build/Release/sandbox1/.config && mkdir -p build/Release/sandbox1/share/
+	rm -rf build/Release/sandbox2 && mkdir -p build/Release/sandbox2/.config && mkdir -p build/Release/sandbox2/share/
+	rm -rf build/Release/sandbox3 && mkdir -p build/Release/sandbox3/.config && mkdir -p build/Release/sandbox3/share/
+	ln -s `pwd`/sandbox1-settings.json build/Release/sandbox1/.config/settings.json
+	ln -s `pwd`/sandbox2-settings.json build/Release/sandbox2/.config/settings.json
+	ln -s `pwd`/sandbox3-settings.json build/Release/sandbox3/.config/settings.json
+	ln -s `pwd`/sandbox1-watches.json build/Release/sandbox1/.config/watches.json
+	ln -s `pwd`/sandbox2-watches.json build/Release/sandbox2/.config/watches.json
+	ln -s `pwd`/sandbox3-watches.json build/Release/sandbox3/.config/watches.json
+	ln -s `pwd`/sandbox1-dir-guids.json build/Release/sandbox1/.config/dir-guids.json
+	ln -s `pwd`/sandbox2-dir-guids.json build/Release/sandbox2/.config/dir-guids.json
+	ln -s `pwd`/sandbox3-dir-guids.json build/Release/sandbox3/.config/dir-guids.json
 	cp SUMMARY.md build/Release/sandbox1/share/
 	cp README.md build/Release/sandbox2/share/
 	mkdir -p build/Release/sandbox1/share/myfiles

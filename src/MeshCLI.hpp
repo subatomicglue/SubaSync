@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
+#include <map>
 #include <functional>
 #include <mutex>
 #include <condition_variable>
@@ -51,10 +52,14 @@ public:
     : pm_(std::move(pm)), settings_(std::move(settings)), running_(true),
       default_watch_interval_(default_watch_interval), audio_notifications_(audio_notifications) {
     ensure_directories();
+    load_dir_guid_registry();
+    apply_dir_guid_registry();
     index_share_root();
     load_ignore_config();
     apply_setting_side_effects("audio_notifications");
     apply_setting_side_effects("transfer_debug");
+    apply_setting_side_effects("transfer_progress");
+    apply_setting_side_effects("progress_meter_size");
     pm_->set_listing_refresh_callback([this](){
       index_share_root();
     });
@@ -68,6 +73,7 @@ public:
   ~MeshCLI() {
     pm_->set_chat_callback(nullptr);
     pm_->set_listing_refresh_callback(nullptr);
+    save_dir_guid_registry();
   }
 
   void start() {
@@ -103,6 +109,8 @@ private:
   std::thread cli_thread_;
   std::chrono::seconds default_watch_interval_;
   bool audio_notifications_ = false;
+  bool transfer_progress_enabled_ = true;
+  std::size_t progress_meter_size_ = 80;
   std::chrono::milliseconds chunk_timeout_{10000};
 
   struct WatchEntry {
@@ -120,6 +128,22 @@ private:
     std::chrono::steady_clock::time_point next_run{};
   };
 
+  struct ResourceIdentifier {
+    enum class Kind {
+      Listing,
+      Watch
+    };
+    Kind kind = Kind::Listing;
+    ListCommand list{};
+    WatchEntry watch{};
+  };
+
+  struct RemovalStats {
+    std::size_t deleted = 0;
+    std::size_t missing = 0;
+    std::size_t failed = 0;
+  };
+
   struct SyncOutcome {
     bool success = true;
     bool changed = false;
@@ -128,6 +152,11 @@ private:
   struct ResolvedDirGuid {
     std::string guid;
     std::string origin_peer;
+  };
+
+  struct WatchSourceResolution {
+    WatchEntry::Source source;
+    ResolvedDirGuid resolved;
   };
 
   struct ConflictEntry {
@@ -170,6 +199,25 @@ private:
   std::vector<ConflictEntry> conflicts_;
   IgnoreConfig ignore_config_;
   std::optional<StagedConflict> staged_conflict_;
+
+  struct DirGuidRecord {
+    std::string guid;
+    std::string path;
+    bool active = false;
+  };
+
+  std::unordered_map<std::string, DirGuidRecord> dir_guid_records_;
+  std::unordered_map<std::string, std::string> dir_guid_by_path_;
+  bool dir_guid_registry_dirty_ = false;
+  mutable std::mutex dir_guid_mutex_;
+
+  enum class PeerListingState { NotConnected, Timeout, Completed };
+  struct PeerListingResult {
+    PeerListingState state = PeerListingState::NotConnected;
+    std::vector<PeerManager::RemoteListingItem> items;
+  };
+
+  enum class SourceReachability { Online, Timeout, Missing, Offline };
 
 #if !defined(HAVE_READLINE)
   std::vector<std::string> cli_history_;
@@ -222,10 +270,20 @@ private:
         std::getline(iss, args);
         trim(args);
         handle_watch_command(args);
+      } else if(cmd == "unwatch") {
+        std::string args;
+        std::getline(iss, args);
+        trim(args);
+        std::string forwarded = "remove";
+        if(!args.empty()) {
+          forwarded += " ";
+          forwarded += args;
+        }
+        handle_watch_command(forwarded);
       } else if(cmd == "bell") {
         std::cout << '\a';
         std::cout.flush();
-      } else if(cmd == "settings") {
+      } else if(cmd == "settings" || cmd == "s") {
         std::string args;
         std::getline(iss, args);
         trim(args);
@@ -235,6 +293,11 @@ private:
         std::getline(iss, args);
         trim(args);
         handle_ignore_command(args);
+      } else if(cmd == "guid") {
+        std::string args;
+        std::getline(iss, args);
+        trim(args);
+        handle_guid_command(args);
       } else if(cmd == "conflict") {
         std::string args;
         std::getline(iss, args);
@@ -254,6 +317,10 @@ private:
         std::cout << "Unknown command: " << cmd << "\n";
       }
     }
+  }
+
+  std::filesystem::path dir_guid_registry_path() const {
+    return config_root() / "dir-guids.json";
   }
 
   void send_chat(const std::string& msg) {
@@ -571,7 +638,7 @@ private:
   }
 
   void list_local(const std::string& cli_path) {
-    index_share_root();
+    auto orphaned = index_share_root();
     auto normalized = normalize_cli_path(cli_path);
     if(is_internal_listing_path(normalized)) {
       std::cout << "Path is reserved for staging.\n";
@@ -582,17 +649,21 @@ private:
       std::cout << "Listing is empty.\n";
       return;
     }
-    print_listing(items, false);
+    maybe_suggest_guid_mapping(items);
+    print_orphan_hint(orphaned);
+    print_listing(items, true);  // true = show peer prefix;  false dont show peer prefix
   }
 
   void list_local_dir_guid(const std::string& guid) {
-    index_share_root();
+    auto orphaned = index_share_root();
     auto items = pm_->local_listing_for_dir_guid(guid);
     if(items.empty()) {
       std::cout << "Directory not found for GUID " << guid << "\n";
       return;
     }
-    print_listing(items, false);
+    maybe_suggest_guid_mapping(items);
+    print_orphan_hint(orphaned);
+    print_listing(items, true);  // true = show peer prefix;  false dont show peer prefix
   }
 
   void list_remote_path(const std::string& peer, const std::string& cli_path, const std::string& dir_guid) {
@@ -659,7 +730,31 @@ private:
   }
 
   void sync_command(const std::string& target) {
-    if(target.empty()) {
+    sync_command_impl(target, true);
+  }
+
+  void sync_command_impl(const std::string& target, bool allow_force) {
+    std::string trimmed = target;
+    trim(trimmed);
+
+    if(allow_force) {
+      std::istringstream prefix(trimmed);
+      std::string maybe_force;
+      prefix >> maybe_force;
+      if(maybe_force == "force") {
+        std::string remainder;
+        std::getline(prefix, remainder);
+        trim(remainder);
+        if(remainder.empty()) {
+          std::cout << "Usage: sync force <resource>\n";
+        } else {
+          sync_force_command(remainder);
+        }
+        return;
+      }
+    }
+
+    if(trimmed.empty()) {
       std::size_t bumped = 0;
       {
         std::lock_guard<std::mutex> lock(watch_mutex_);
@@ -681,7 +776,7 @@ private:
     std::string source_arg;
     std::string dest_raw;
     {
-      std::istringstream iss(target);
+      std::istringstream iss(trimmed);
       iss >> source_arg;
       std::getline(iss, dest_raw);
     }
@@ -701,41 +796,59 @@ private:
       return;
     }
 
-    auto parsed = parse_list_command(source_arg);
-    if(!parsed) {
+    auto resolved = resolve_resource_identifier(source_arg);
+    if(!resolved) {
       std::cout << "Invalid sync target.\n";
       return;
     }
 
-    if((parsed->type == ListCommand::Type::RemotePath ||
-        parsed->type == ListCommand::Type::RemoteHash ||
-        parsed->type == ListCommand::Type::RemoteDirectoryGuid) &&
-        parsed->peer == pm_->local_peer_id()) {
+    if(resolved->kind == ResourceIdentifier::Kind::Watch) {
+      if(dest_override) {
+        std::cout << "Destination overrides are not supported when syncing a watch.\n";
+        return;
+      }
+      auto result = run_single_watch(resolved->watch);
+      if(!result.success) {
+        std::cout << "[watch " << resolved->watch.id << "] sync failed.\n";
+      } else if(!result.changed) {
+        std::cout << "[watch " << resolved->watch.id << "] already up to date.\n";
+      } else {
+        std::cout << "[watch " << resolved->watch.id << "] synced.\n";
+      }
+      return;
+    }
+
+    auto parsed = resolved->list;
+
+    if((parsed.type == ListCommand::Type::RemotePath ||
+        parsed.type == ListCommand::Type::RemoteHash ||
+        parsed.type == ListCommand::Type::RemoteDirectoryGuid) &&
+        parsed.peer == pm_->local_peer_id()) {
       std::cout << "Cannot sync from self.\n";
       std::cout << "Nothing to sync.\n";
       return;
     }
 
     std::vector<PeerManager::RemoteListingItem> entries;
-    switch(parsed->type) {
+    switch(parsed.type) {
       case ListCommand::Type::RemotePath:
-        if(is_internal_listing_path(parsed->path)) {
-          std::cout << "Path is reserved on " << parsed->peer << ".\n";
+        if(is_internal_listing_path(parsed.path)) {
+          std::cout << "Path is reserved on " << parsed.peer << ".\n";
           return;
         }
-        entries = blocking_list_peer(parsed->peer, parsed->path, "", "");
+        entries = blocking_list_peer(parsed.peer, parsed.path, "", "");
         break;
       case ListCommand::Type::RemoteHash:
-        entries = blocking_list_peer(parsed->peer, "", parsed->hash, "");
+        entries = blocking_list_peer(parsed.peer, "", parsed.hash, "");
         break;
       case ListCommand::Type::HashAll:
-        entries = blocking_list_hash(parsed->hash);
+        entries = blocking_list_hash(parsed.hash);
         break;
       case ListCommand::Type::DirectoryGuid:
-        entries = pm_->local_listing_for_dir_guid(parsed->dir_guid);
+        entries = pm_->local_listing_for_dir_guid(parsed.dir_guid);
         break;
       case ListCommand::Type::RemoteDirectoryGuid:
-        entries = blocking_list_peer(parsed->peer, "", "", parsed->dir_guid);
+        entries = blocking_list_peer(parsed.peer, "", "", parsed.dir_guid);
         break;
       case ListCommand::Type::LocalPath:
         std::cout << "Sync expects a peer or hash target.\n";
@@ -754,12 +867,236 @@ private:
       return;
     }
 
-    auto result = perform_sync(*parsed, std::move(entries), dest_override, dest_is_directory, false, nullptr);
+    auto result = perform_sync(parsed, std::move(entries), dest_override, dest_is_directory, false, nullptr);
     if(!result.success) {
       std::cout << "Sync failed.\n";
     } else if(!result.changed) {
       std::cout << "Already up to date.\n";
     }
+  }
+
+  void sync_force_command(const std::string& resource_spec) {
+    std::string trimmed = resource_spec;
+    trim(trimmed);
+    if(trimmed.empty()) {
+      std::cout << "Usage: sync force <resource>\n";
+      return;
+    }
+
+    auto resolved = resolve_resource_identifier(trimmed);
+    if(!resolved) {
+      std::cout << "Invalid resource identifier.\n";
+      return;
+    }
+
+    std::vector<std::string> warnings;
+    auto targets = resource_local_targets(*resolved, &warnings);
+    for(const auto& warning : warnings) {
+      std::cout << warning << "\n";
+    }
+
+    if(targets.empty()) {
+      std::cout << "No local data found for " << describe_resource(*resolved) << ".\n";
+    } else {
+      auto stats = purge_local_paths(targets);
+      index_share_root();
+      if(stats.deleted > 0 || stats.missing > 0 || stats.failed > 0) {
+        std::cout << "force-sync removed " << stats.deleted << " target"
+                  << (stats.deleted == 1 ? "" : "s")
+                  << ", " << stats.missing << " already missing";
+        if(stats.failed > 0) {
+          std::cout << ", " << stats.failed << " failed";
+        }
+        std::cout << ".\n";
+      }
+    }
+
+    sync_command_impl(trimmed, false);
+  }
+
+  std::optional<ResourceIdentifier> resolve_resource_identifier(const std::string& raw) {
+    std::string input = raw;
+    trim(input);
+    if(input.empty()) return std::nullopt;
+
+    if(auto watch = snapshot_watch_by_id(input)) {
+      ResourceIdentifier id;
+      id.kind = ResourceIdentifier::Kind::Watch;
+      id.watch = *watch;
+      return id;
+    }
+
+    auto parsed = parse_list_command(input);
+    if(!parsed) return std::nullopt;
+
+    ResourceIdentifier id;
+    id.kind = ResourceIdentifier::Kind::Listing;
+    id.list = *parsed;
+    return id;
+  }
+
+  std::optional<WatchEntry> snapshot_watch_by_id(const std::string& id) {
+    std::lock_guard<std::mutex> lock(watch_mutex_);
+    auto* entry = find_watch_by_id(id);
+    if(!entry) return std::nullopt;
+    return *entry;
+  }
+
+  std::string describe_resource(const ResourceIdentifier& resource) const {
+    if(resource.kind == ResourceIdentifier::Kind::Watch) {
+      return "watch " + resource.watch.id;
+    }
+
+    const auto& cmd = resource.list;
+    switch(cmd.type) {
+      case ListCommand::Type::LocalPath:
+        return cmd.path.empty() ? "local share root" : ("/" + cmd.path);
+      case ListCommand::Type::RemotePath:
+        return cmd.peer + ":/" + cmd.path;
+      case ListCommand::Type::RemoteHash:
+        return cmd.peer + ":#" + cmd.hash.substr(0, 8);
+      case ListCommand::Type::HashAll:
+        return "hash " + cmd.hash.substr(0, 8);
+      case ListCommand::Type::DirectoryGuid:
+        return "dir-guid " + cmd.dir_guid;
+      case ListCommand::Type::RemoteDirectoryGuid:
+        return cmd.peer + ":/" + cmd.dir_guid;
+      default:
+        return "resource";
+    }
+  }
+
+  std::vector<std::string> resource_local_targets(const ResourceIdentifier& resource,
+                                                  std::vector<std::string>* warnings = nullptr) {
+    auto normalize_candidate = [&](const std::string& raw) -> std::string {
+      auto normalized = normalize_cli_path(raw);
+      if(normalized.empty()) return {};
+      if(is_internal_listing_path(normalized)) return {};
+      return normalized;
+    };
+
+    auto add_guid_root = [&](const std::string& guid,
+                             std::vector<std::string>& out){
+      if(guid.empty()) return false;
+      bool added = false;
+      if(auto active = active_path_for_guid(guid)) {
+        auto normalized = normalize_candidate(*active);
+        if(!normalized.empty()) {
+          out.push_back(std::move(normalized));
+          added = true;
+        }
+      }
+      if(!added) {
+        auto items = pm_->local_listing_for_dir_guid(guid);
+        std::unordered_set<std::string> roots;
+        for(const auto& item : items) {
+          if(item.relative_path.empty()) continue;
+          std::string normalized = normalize_cli_path(item.relative_path);
+          if(normalized.empty()) continue;
+          auto slash = normalized.find('/');
+          auto root = slash == std::string::npos ? normalized : normalized.substr(0, slash);
+          auto cleaned = normalize_candidate(root);
+          if(cleaned.empty()) continue;
+          if(!roots.insert(cleaned).second) continue;
+          out.push_back(cleaned);
+          added = true;
+        }
+      }
+      if(!added && warnings) {
+        warnings->push_back("No local directory mapping found for GUID " + guid + ".");
+      }
+      return added;
+    };
+
+    std::vector<std::string> result;
+
+    if(resource.kind == ResourceIdentifier::Kind::Watch) {
+      bool added = false;
+      if(auto binding = watch_binding_path_candidate(resource.watch)) {
+        auto normalized = normalize_candidate(*binding);
+        if(!normalized.empty()) {
+          result.push_back(std::move(normalized));
+          added = true;
+        }
+      }
+      if(!resource.watch.dir_guid.empty()) {
+        added = add_guid_root(resource.watch.dir_guid, result) || added;
+      }
+      if(!added && warnings) {
+        warnings->push_back("Watch " + resource.watch.id + " has no local destination to clear.");
+      }
+    } else {
+      const auto& cmd = resource.list;
+      switch(cmd.type) {
+        case ListCommand::Type::LocalPath:
+          if(cmd.path.empty()) {
+            if(warnings) warnings->push_back("Cannot force sync the entire local share root.");
+          } else if(auto normalized = normalize_candidate(cmd.path); !normalized.empty()) {
+            result.push_back(std::move(normalized));
+          }
+          break;
+        case ListCommand::Type::RemotePath:
+          if(cmd.path.empty()) {
+            if(warnings) warnings->push_back("Specify a sub-path when forcing a remote sync.");
+          } else if(auto normalized = normalize_candidate(cmd.path); !normalized.empty()) {
+            result.push_back(std::move(normalized));
+          }
+          break;
+        case ListCommand::Type::RemoteHash:
+        case ListCommand::Type::HashAll: {
+          auto entries = pm_->local_listing_for_hash(cmd.hash);
+          if(entries.empty() && warnings) {
+            warnings->push_back("No local files currently match hash " + cmd.hash.substr(0, 8) + ".");
+          }
+          for(const auto& entry : entries) {
+            if(auto normalized = normalize_candidate(entry.relative_path); !normalized.empty()) {
+              result.push_back(std::move(normalized));
+            }
+          }
+          break;
+        }
+        case ListCommand::Type::DirectoryGuid:
+        case ListCommand::Type::RemoteDirectoryGuid:
+          add_guid_root(cmd.dir_guid, result);
+          break;
+      }
+    }
+
+    result.erase(std::remove_if(result.begin(), result.end(),
+      [](const std::string& value){ return value.empty(); }), result.end());
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+  }
+
+  RemovalStats purge_local_paths(const std::vector<std::string>& rel_paths) {
+    RemovalStats stats;
+    std::unordered_set<std::string> unique(rel_paths.begin(), rel_paths.end());
+    for(const auto& rel : unique) {
+      if(rel.empty()) continue;
+      auto target = share_root() / rel;
+      std::error_code ec;
+      bool exists = std::filesystem::exists(target, ec);
+      if(ec) {
+        ++stats.failed;
+        std::cout << "Failed to inspect " << rel << ": " << ec.message() << "\n";
+      } else if(!exists) {
+        ++stats.missing;
+      } else {
+        auto removed = std::filesystem::remove_all(target, ec);
+        if(ec) {
+          ++stats.failed;
+          std::cout << "Failed to remove " << rel << ": " << ec.message() << "\n";
+        } else {
+          ++stats.deleted;
+          std::cout << "Removed " << rel << " (" << removed << " item" << (removed == 1 ? "" : "s") << ")\n";
+        }
+      }
+
+      auto staging = download_root() / rel;
+      std::filesystem::remove_all(staging, ec);
+    }
+    return stats;
   }
 
   SyncOutcome perform_sync(const ListCommand& cmd,
@@ -799,13 +1136,13 @@ private:
         ensure_directory_exists(download_root() / dir_dest);
         ensure_directory_exists(share_root() / dir_dest);
       }
-      if(!dir_string.empty()) {
-        if(!item.directory_guid.empty()) {
-          pm_->register_directory_with_guid(dir_string, item.directory_guid);
-        } else {
-          pm_->register_directory(dir_string);
+        if(!dir_string.empty()) {
+          if(!item.directory_guid.empty()) {
+            remember_dir_guid_mapping(dir_string, item.directory_guid);
+          } else {
+            pm_->register_directory(dir_string);
+          }
         }
-      }
       auto dir_result = sync_directory(item.peer_id,
                                        item.relative_path,
                                        item.directory_guid,
@@ -908,7 +1245,7 @@ private:
         }
         if(!sub_string.empty()) {
           if(!item.directory_guid.empty()) {
-            pm_->register_directory_with_guid(sub_string, item.directory_guid);
+            remember_dir_guid_mapping(sub_string, item.directory_guid);
           } else {
             pm_->register_directory(sub_string);
           }
@@ -1032,14 +1369,19 @@ private:
       return outcome;
     }
 
+    const std::size_t chunk_size = PeerManager::kMaxChunkSize;
+    const std::size_t total_chunks = static_cast<std::size_t>((file_size + chunk_size - 1) / chunk_size);
+    std::vector<uint8_t> chunk_states(total_chunks, 0);
+    const bool enable_meter = transfer_progress_enabled_ && !quiet && total_chunks > 0;
+
     auto relative_parent = sanitize_relative(final_path.parent_path().lexically_relative(share_root()));
     auto relative_parent_str = relative_parent.generic_string();
-    if(!relative_parent_str.empty()) {
-      if(!primary.directory_guid.empty()) {
-        pm_->register_directory_with_guid(relative_parent_str, primary.directory_guid);
-      } else {
-        pm_->register_directory(relative_parent_str);
-      }
+      if(!relative_parent_str.empty()) {
+        if(!primary.directory_guid.empty()) {
+          remember_dir_guid_mapping(relative_parent_str, primary.directory_guid);
+        } else {
+          pm_->register_directory(relative_parent_str);
+        }
       if(!dir_guid_opt || *dir_guid_opt != primary.directory_guid) {
         dir_guid_opt = pm_->directory_guid_for_path(relative_parent_str);
       }
@@ -1084,7 +1426,6 @@ private:
       }
 
       const std::size_t max_failures_per_peer = 3;
-      const std::size_t chunk_size = PeerManager::kMaxChunkSize;
       uint64_t offset = 0;
       std::size_t cursor = 0;
 
@@ -1132,6 +1473,7 @@ private:
             continue;
           }
 
+          std::size_t chunk_index = static_cast<std::size_t>(offset / chunk_size);
           out.write(resp.data.data(), static_cast<std::streamsize>(resp.data.size()));
           if(!out) {
             if(!quiet_attempt) std::cout << "\nFailed writing chunk for " << primary.hash << "\n";
@@ -1142,11 +1484,19 @@ private:
           }
 
           offset += resp.data.size();
+          if(enable_meter && chunk_index < chunk_states.size()) {
+            chunk_states[chunk_index] = 1;
+          }
           state.failures = 0;
           if(!quiet_attempt) {
-            double progress = static_cast<double>(offset) / static_cast<double>(file_size) * 100.0;
-            std::cout << "\rSyncing " << primary.hash.substr(0, 8) << "... "
-                      << std::fixed << std::setprecision(1) << progress << "%";
+            if(enable_meter) {
+              auto meter = format_transfer_meter(chunk_states, offset, file_size, chunk_size);
+              std::cout << "\rSyncing " << primary.hash.substr(0, 8) << "... " << meter;
+            } else {
+              double progress = static_cast<double>(offset) / static_cast<double>(file_size) * 100.0;
+              std::cout << "\rSyncing " << primary.hash.substr(0, 8) << "... "
+                        << std::fixed << std::setprecision(1) << progress << "%";
+            }
             std::cout.flush();
           }
           chunk_ok = true;
@@ -1301,6 +1651,28 @@ private:
     return cleaned;
   }
 
+  static std::string normalize_relative_string(const std::string& input) {
+    if(input.empty()) return "";
+    auto cleaned = sanitize_relative(std::filesystem::path(input));
+    auto normalized = cleaned.generic_string();
+    while(!normalized.empty() && normalized.front() == '/') {
+      normalized.erase(normalized.begin());
+    }
+    while(!normalized.empty() && normalized.back() == '/') {
+      normalized.pop_back();
+    }
+    return normalized;
+  }
+
+  static std::string basename_for_relative_path(const std::string& path) {
+    if(path.empty()) return "";
+    auto normalized = normalize_relative_string(path);
+    if(normalized.empty()) return "";
+    auto pos = normalized.find_last_of('/');
+    if(pos == std::string::npos) return normalized;
+    return normalized.substr(pos + 1);
+  }
+
   static std::filesystem::path relative_within(const std::string& base, const std::string& full) {
     if(base.empty()) return std::filesystem::path(full);
     std::filesystem::path full_path(full);
@@ -1321,8 +1693,16 @@ private:
     std::filesystem::create_directories(dir, ec);
   }
 
+  bool directory_exists_relative(const std::string& relative_path) const {
+    if(relative_path.empty()) return false;
+    auto absolute = share_root() / relative_path;
+    std::error_code ec;
+    return std::filesystem::exists(absolute, ec) &&
+           std::filesystem::is_directory(absolute, ec);
+  }
+
   std::filesystem::path watch_file_path() const {
-    return std::filesystem::current_path() / "watches.json";
+    return config_root() / "watches.json";
   }
 
   void load_watches() {
@@ -1335,48 +1715,58 @@ private:
       return;
     }
 
-    std::lock_guard<std::mutex> lock(watch_mutex_);
-    watches_.clear();
-    if(!doc.contains("watches")) return;
-    for(const auto& item : doc["watches"]) {
-      WatchEntry entry;
-      entry.id = item.value("id", generate_watch_id());
-      if(item.contains("sources")) {
-        for(const auto& src : item["sources"]) {
+    std::vector<std::pair<std::string, std::string>> pending_bindings;
+    {
+      std::lock_guard<std::mutex> lock(watch_mutex_);
+      watches_.clear();
+      if(!doc.contains("watches")) return;
+      for(const auto& item : doc["watches"]) {
+        WatchEntry entry;
+        entry.id = item.value("id", generate_watch_id());
+        if(item.contains("sources")) {
+          for(const auto& src : item["sources"]) {
+            WatchEntry::Source s;
+            s.peer = src.value("peer", "");
+            s.path = normalize_cli_path(src.value("path", ""));
+            if(!s.peer.empty()) entry.sources.push_back(std::move(s));
+          }
+        } else {
           WatchEntry::Source s;
-          s.peer = src.value("peer", "");
-          s.path = normalize_cli_path(src.value("path", ""));
+          s.peer = item.value("peer", "");
+          s.path = normalize_cli_path(item.value("path", ""));
           if(!s.peer.empty()) entry.sources.push_back(std::move(s));
         }
-      } else {
-        WatchEntry::Source s;
-        s.peer = item.value("peer", "");
-        s.path = normalize_cli_path(item.value("path", ""));
-        if(!s.peer.empty()) entry.sources.push_back(std::move(s));
+        entry.dir_guid = item.value("dir_guid", "");
+        entry.origin_peer = item.value("origin_peer", "");
+        entry.dest_path = normalize_cli_path(item.value("dest", ""));
+        entry.dest_is_directory = item.value("dest_is_directory", true);
+        auto interval_seconds = item.value("interval", static_cast<int>(default_watch_interval_.count()));
+        entry.interval = std::chrono::seconds(interval_seconds > 0 ? interval_seconds : default_watch_interval_.count());
+        entry.next_run = std::chrono::steady_clock::now();
+        if(entry.sources.empty()) continue;
+        entry.sources.erase(std::remove_if(entry.sources.begin(), entry.sources.end(),
+          [&](const WatchEntry::Source& src){ return src.peer.empty() || is_internal_listing_path(src.path); }),
+          entry.sources.end());
+        if(entry.sources.empty()) continue;
+        if(entry.origin_peer.empty() ||
+           std::none_of(entry.sources.begin(), entry.sources.end(),
+             [&](const WatchEntry::Source& src){ return src.peer == entry.origin_peer; })) {
+          entry.origin_peer = entry.sources.front().peer;
+        }
+        if(is_internal_listing_path(entry.dest_path)) continue;
+        watches_.push_back(std::move(entry));
+        auto& stored = watches_.back();
+        if(!stored.dir_guid.empty() && !stored.origin_peer.empty()) {
+          pm_->set_directory_origin(stored.dir_guid, stored.origin_peer);
+          if(auto local = watch_binding_path_candidate(stored)) {
+            pending_bindings.emplace_back(*local, stored.dir_guid);
+          }
+        }
       }
-      entry.dir_guid = item.value("dir_guid", "");
-      entry.origin_peer = item.value("origin_peer", "");
-      entry.dest_path = normalize_cli_path(item.value("dest", ""));
-      entry.dest_is_directory = item.value("dest_is_directory", true);
-      auto interval_seconds = item.value("interval", static_cast<int>(default_watch_interval_.count()));
-      entry.interval = std::chrono::seconds(interval_seconds > 0 ? interval_seconds : default_watch_interval_.count());
-      entry.next_run = std::chrono::steady_clock::now();
-      if(entry.sources.empty()) continue;
-      entry.sources.erase(std::remove_if(entry.sources.begin(), entry.sources.end(),
-        [&](const WatchEntry::Source& src){ return src.peer.empty() || is_internal_listing_path(src.path); }),
-        entry.sources.end());
-      if(entry.sources.empty()) continue;
-      if(entry.origin_peer.empty() ||
-         std::none_of(entry.sources.begin(), entry.sources.end(),
-           [&](const WatchEntry::Source& src){ return src.peer == entry.origin_peer; })) {
-        entry.origin_peer = entry.sources.front().peer;
-      }
-      if(is_internal_listing_path(entry.dest_path)) continue;
-      watches_.push_back(std::move(entry));
-      auto& stored = watches_.back();
-      if(!stored.dir_guid.empty() && !stored.origin_peer.empty()) {
-        pm_->set_directory_origin(stored.dir_guid, stored.origin_peer);
-      }
+    }
+
+    for(const auto& [path, guid] : pending_bindings) {
+      remember_dir_guid_mapping(path, guid);
     }
   }
 
@@ -1404,19 +1794,26 @@ private:
         doc["watches"].push_back(item);
       }
     }
-    std::ofstream out(watch_file_path());
+    auto watch_path = watch_file_path();
+    std::error_code ec;
+    std::filesystem::create_directories(watch_path.parent_path(), ec);
+    std::ofstream out(watch_path);
     if(out) {
       out << doc.dump(2);
     }
   }
 
   void list_watches() {
-    std::lock_guard<std::mutex> lock(watch_mutex_);
-    if(watches_.empty()) {
+    std::vector<WatchEntry> snapshot;
+    {
+      std::lock_guard<std::mutex> lock(watch_mutex_);
+      snapshot = watches_;
+    }
+    if(snapshot.empty()) {
       std::cout << "No watches configured.\n";
       return;
     }
-    for(const auto& entry : watches_) {
+    for(const auto& entry : snapshot) {
       std::cout << entry.id << " -> ";
       bool first = true;
       for(const auto& src : entry.sources) {
@@ -1425,10 +1822,38 @@ private:
         std::cout << src.peer << ":/" << (entry.dir_guid.empty() ? src.path : entry.dir_guid);
       }
       if(first) std::cout << "(no sources)";
-      std::cout << "  dest=" << (entry.dest_path.empty() ? "(default)" : entry.dest_path)
+      auto local_label = watch_local_target_label(entry);
+      std::cout << "  local=" << local_label
                 << "  every " << entry.interval.count() << "s";
+      auto peer_statuses = gather_watch_peer_status(entry);
+      if(!peer_statuses.empty()) {
+        std::size_t online = 0;
+        for(const auto& kv : peer_statuses) {
+          if(kv.second == SourceReachability::Online) ++online;
+        }
+        std::cout << "  peers=" << online << "/" << peer_statuses.size() << " [";
+        bool first_status = true;
+        for(const auto& kv : peer_statuses) {
+          if(!first_status) std::cout << ", ";
+          first_status = false;
+          std::cout << kv.first << ":" << reachability_label(kv.second);
+        }
+        std::cout << "]";
+      }
       if(!entry.origin_peer.empty()) {
-        std::cout << "  origin=" << entry.origin_peer;
+        SourceReachability origin_state = SourceReachability::Offline;
+        auto it = peer_statuses.find(entry.origin_peer);
+        if(it != peer_statuses.end()) {
+          origin_state = it->second;
+        } else {
+          WatchEntry::Source probe;
+          probe.peer = entry.origin_peer;
+          if(entry.dir_guid.empty() && !entry.sources.empty()) {
+            probe.path = entry.sources.front().path;
+          }
+          origin_state = check_watch_source(entry, probe);
+        }
+        std::cout << "  origin=" << entry.origin_peer << "(" << reachability_label(origin_state) << ")";
       }
       std::cout << "\n";
     }
@@ -1660,7 +2085,9 @@ private:
   }
 
   std::optional<ResolvedDirGuid> resolve_remote_dir_guid(const std::string& peer,
-                                                         const std::string& path) {
+                                                         const std::string& path,
+                                                         bool* path_was_file = nullptr) {
+    if(path_was_file) *path_was_file = false;
     auto normalized = normalize_cli_path(path);
     if(normalized.empty()) return std::nullopt;
     std::filesystem::path p(normalized);
@@ -1671,18 +2098,487 @@ private:
         return is_internal_listing_path(item.relative_path);
       }), listings.end());
     notify_untrusted_directory_sources(listings);
+    bool saw_file_match = false;
     for(const auto& item : listings) {
-      if(!item.is_directory) continue;
-      if(item.directory_guid.empty()) continue;
       auto candidate = normalize_cli_path(item.relative_path);
-      if(candidate == normalized) {
+      if(candidate != normalized) continue;
+      if(item.is_directory) {
+        if(item.directory_guid.empty()) continue;
         ResolvedDirGuid resolved;
         resolved.guid = item.directory_guid;
         resolved.origin_peer = item.origin_peer.empty() ? peer : item.origin_peer;
+        if(path_was_file) *path_was_file = false;
         return resolved;
+      } else {
+        saw_file_match = true;
+      }
+    }
+    if(path_was_file) *path_was_file = saw_file_match;
+    return std::nullopt;
+  }
+
+  std::optional<std::string> active_path_for_guid(const std::string& guid) const {
+    if(guid.empty()) return std::nullopt;
+    std::lock_guard<std::mutex> lock(dir_guid_mutex_);
+    auto it = dir_guid_records_.find(guid);
+    if(it == dir_guid_records_.end()) return std::nullopt;
+    if(!it->second.active || it->second.path.empty()) return std::nullopt;
+    return it->second.path;
+  }
+
+  std::string watch_local_target_label(const WatchEntry& entry) const {
+    if(!entry.dest_path.empty()) {
+      return entry.dest_path + " (override)";
+    }
+    auto local = active_path_for_guid(entry.dir_guid);
+    if(local) return *local;
+    if(!entry.dir_guid.empty()) {
+      if(!entry.sources.empty() && !entry.sources.front().path.empty()) {
+        return entry.sources.front().path + " (default)";
+      }
+      return "(unmapped)";
+    }
+    if(!entry.sources.empty() && !entry.sources.front().path.empty()) {
+      return entry.sources.front().path + " (default)";
+    }
+    return "(unmapped)";
+  }
+
+  std::optional<std::string> watch_binding_path_candidate(const WatchEntry& entry) const {
+    if(!entry.dest_path.empty() && !is_internal_listing_path(entry.dest_path)) {
+      return entry.dest_path;
+    }
+    if(!entry.sources.empty()) {
+      for(const auto& src : entry.sources) {
+        if(!src.path.empty() && !is_internal_listing_path(src.path)) {
+          return src.path;
+        }
       }
     }
     return std::nullopt;
+  }
+
+  std::optional<std::string> default_peer_for_guid(const std::string& guid) {
+    if(guid.empty()) return std::nullopt;
+    if(auto origin = pm_->directory_origin(guid)) {
+      if(!origin->empty()) return origin;
+    }
+    std::lock_guard<std::mutex> lock(watch_mutex_);
+    auto* existing = find_watch_by_guid(guid);
+    if(existing) {
+      std::string peer = existing->origin_peer;
+      if(peer.empty() && !existing->sources.empty()) {
+        peer = existing->sources.front().peer;
+      }
+      if(!peer.empty()) return peer;
+    }
+    return std::nullopt;
+  }
+
+  static std::string format_remote_source_label(const std::string& peer,
+                                                const std::string& path_or_guid) {
+    if(peer.empty()) return path_or_guid;
+    std::string label = peer + ":/";
+    label += path_or_guid;
+    return label;
+  }
+
+  std::optional<WatchSourceResolution> resolve_watch_resource(const std::string& spec,
+                                                              std::string& error,
+                                                              const std::string& default_peer = "") {
+    auto resource = resolve_resource_identifier(spec);
+    if(!resource) {
+      error = "Unable to parse watch target '" + spec + "'.";
+      return std::nullopt;
+    }
+    if(resource->kind != ResourceIdentifier::Kind::Listing) {
+      error = "Watch targets must reference a peer path or directory GUID.";
+      return std::nullopt;
+    }
+
+    auto ensure_peer_valid = [&](const std::string& peer) -> bool {
+      if(peer.empty()) {
+        error = "Peer is required for this watch target.";
+        return false;
+      }
+      if(peer == pm_->local_peer_id()) {
+        error = "Cannot watch self.";
+        return false;
+      }
+      return true;
+    };
+
+    WatchSourceResolution result;
+    const auto& cmd = resource->list;
+    switch(cmd.type) {
+      case ListCommand::Type::RemotePath: {
+        if(!ensure_peer_valid(cmd.peer)) return std::nullopt;
+        auto normalized = normalize_cli_path(cmd.path);
+        if(is_internal_listing_path(normalized)) {
+          error = "Cannot watch reserved staging path " + format_remote_source_label(cmd.peer, normalized) + ".";
+          return std::nullopt;
+        }
+        bool source_was_file = false;
+        auto resolved = resolve_remote_dir_guid(cmd.peer, normalized, &source_was_file);
+        if(!resolved) {
+          auto label = format_remote_source_label(cmd.peer, normalized);
+          if(source_was_file) {
+            error = "Cannot watch " + label + " because it is a file. Watches must target directories.";
+          } else {
+            error = "Unable to determine directory GUID for " + label + ". Ensure it exists on the remote peer.";
+          }
+          return std::nullopt;
+        }
+        result.source.peer = cmd.peer;
+        result.source.path = normalized;
+        result.resolved = *resolved;
+        break;
+      }
+      case ListCommand::Type::RemoteDirectoryGuid: {
+        if(!ensure_peer_valid(cmd.peer)) return std::nullopt;
+        if(cmd.dir_guid.empty()) {
+          error = "Directory GUID is required for watch targets.";
+          return std::nullopt;
+        }
+        result.source.peer = cmd.peer;
+        result.source.path.clear();
+        result.resolved.guid = cmd.dir_guid;
+        result.resolved.origin_peer = cmd.peer;
+        break;
+      }
+      case ListCommand::Type::DirectoryGuid: {
+        std::string peer_choice = default_peer;
+        if(peer_choice.empty()) {
+          auto inferred = default_peer_for_guid(cmd.dir_guid);
+          if(inferred) peer_choice = *inferred;
+        }
+        if(peer_choice.empty()) {
+          error = "Peer is required for directory GUID " + cmd.dir_guid + ". Specify peer:/"
+                  + cmd.dir_guid + ".";
+          return std::nullopt;
+        }
+        if(!ensure_peer_valid(peer_choice)) return std::nullopt;
+        result.source.peer = peer_choice;
+        result.source.path.clear();
+        result.resolved.guid = cmd.dir_guid;
+        result.resolved.origin_peer = peer_choice;
+        break;
+      }
+      default:
+        error = "Watch targets must reference a peer path or directory GUID.";
+        return std::nullopt;
+    }
+
+    if(result.resolved.guid.empty()) {
+      error = "Directory GUID is required to track a watch.";
+      return std::nullopt;
+    }
+
+    return result;
+  }
+
+  std::unordered_set<std::string> active_watch_guids() {
+    std::lock_guard<std::mutex> lock(watch_mutex_);
+    std::unordered_set<std::string> ids;
+    ids.reserve(watches_.size());
+    for(const auto& entry : watches_) {
+      if(!entry.dir_guid.empty()) ids.insert(entry.dir_guid);
+    }
+    return ids;
+  }
+
+  std::optional<std::string> watch_guid_for_path(const std::string& relative_path) {
+    auto normalized = normalize_cli_path(relative_path);
+    if(normalized.empty()) return std::nullopt;
+    std::lock_guard<std::mutex> lock(watch_mutex_);
+    for(const auto& entry : watches_) {
+      if(entry.dir_guid.empty()) continue;
+      auto candidate = watch_binding_path_candidate(entry);
+      if(candidate && normalize_cli_path(*candidate) == normalized) {
+        return entry.dir_guid;
+      }
+    }
+    return std::nullopt;
+  }
+
+  struct WatchAnnotationDisplay {
+    std::optional<std::string> preferred;
+    std::optional<std::string> fallback;
+    bool fallback_unavailable = false;
+  };
+
+  std::vector<std::string> watch_preference_order(const WatchEntry& entry) const {
+    std::vector<std::string> peers;
+    auto add = [&](const std::string& peer) {
+      if(peer.empty()) return;
+      if(std::find(peers.begin(), peers.end(), peer) != peers.end()) return;
+      peers.push_back(peer);
+    };
+    add(entry.origin_peer);
+    for(const auto& src : entry.sources) {
+      add(src.peer);
+    }
+    return peers;
+  }
+
+  std::optional<WatchAnnotationDisplay> watch_annotation_for_guid(const std::string& guid) {
+    if(guid.empty()) return std::nullopt;
+    WatchEntry snapshot;
+    {
+      std::lock_guard<std::mutex> lock(watch_mutex_);
+      auto* entry = find_watch_by_guid(guid);
+      if(!entry) return std::nullopt;
+      snapshot = *entry;
+    }
+
+    auto order = watch_preference_order(snapshot);
+    if(order.empty()) return std::nullopt;
+
+    auto statuses = gather_watch_peer_status(snapshot);
+    auto peer_is_online = [&](const std::string& peer) {
+      auto it = statuses.find(peer);
+      if(it == statuses.end()) {
+        return peer == pm_->local_peer_id();
+      }
+      return it->second == SourceReachability::Online;
+    };
+
+    auto label_for_peer = [&](const std::string& peer) -> std::optional<std::string> {
+      if(peer.empty()) return std::nullopt;
+      auto path = resolve_watch_source_path(snapshot, peer);
+      if(!path) path = std::string{};
+      return format_watch_source_label(peer, *path);
+    };
+
+    WatchAnnotationDisplay display;
+    auto preferred_peer = order.front();
+    display.preferred = label_for_peer(preferred_peer);
+    bool preferred_online = peer_is_online(preferred_peer);
+
+    if(preferred_online) {
+      return display;
+    }
+
+    for(size_t i = 1; i < order.size(); ++i) {
+      const auto& peer = order[i];
+      if(peer_is_online(peer)) {
+        display.fallback = label_for_peer(peer);
+        return display;
+      }
+    }
+
+    display.fallback_unavailable = true;
+    return display;
+  }
+
+  std::optional<std::string> resolve_watch_source_path(const WatchEntry& entry,
+                                                       const std::string& peer) {
+    if(peer.empty()) return std::nullopt;
+    if(peer == pm_->local_peer_id()) {
+      if(auto local = active_path_for_guid(entry.dir_guid)) return local;
+    }
+
+    if(auto remote = fetch_remote_watch_path(entry, peer)) {
+      return remote;
+    }
+
+    auto recorded = std::find_if(entry.sources.begin(), entry.sources.end(),
+      [&](const WatchEntry::Source& src){
+        return src.peer == peer && !src.path.empty();
+      });
+    if(recorded != entry.sources.end()) {
+      return recorded->path;
+    }
+
+    if(peer == pm_->local_peer_id() && !entry.dest_path.empty()) {
+      return entry.dest_path;
+    }
+
+    return std::nullopt;
+  }
+
+  std::optional<std::string> fetch_remote_watch_path(const WatchEntry& entry,
+                                                     const std::string& peer) {
+    if(entry.dir_guid.empty() || peer.empty()) return std::nullopt;
+    auto resp = fetch_peer_listing(peer, "", "", entry.dir_guid, true);
+    if(resp.state != PeerListingState::Completed) return std::nullopt;
+
+    for(const auto& item : resp.items) {
+      if(item.is_directory && item.relative_path.empty() &&
+         item.directory_guid == entry.dir_guid &&
+         !item.listing_root_path.empty()) {
+        auto normalized = normalize_cli_path(item.listing_root_path);
+        if(!normalized.empty()) return normalized;
+        return std::string{};
+      }
+    }
+
+    for(const auto& item : resp.items) {
+      if(item.relative_path.empty()) continue;
+      auto slash = item.relative_path.rfind('/');
+      if(slash == std::string::npos) continue;
+      auto parent = item.relative_path.substr(0, slash);
+      auto normalized = normalize_cli_path(parent);
+      if(normalized.empty()) continue;
+      return normalized;
+    }
+
+    return std::nullopt;
+  }
+
+  std::optional<std::string> format_watch_source_label(const std::string& peer,
+                                                       const std::string& normalized_path) const {
+    if(peer.empty()) return std::nullopt;
+    std::string label = peer + ":/";
+    if(!normalized_path.empty()) {
+      label += normalized_path;
+      if(label.back() != '/') label += "/";
+    }
+    return label;
+  }
+
+  std::string format_transfer_meter(const std::vector<uint8_t>& chunk_states,
+                                    uint64_t downloaded,
+                                    uint64_t total_size,
+                                    std::size_t chunk_size) const {
+    const std::size_t slots = std::max<std::size_t>(1, progress_meter_size_);
+    const std::size_t chunk_width = chunk_size == 0 ? 1 : chunk_size;
+    std::string bar;
+    bar.reserve(slots);
+    if(total_size == 0 || chunk_states.empty()) {
+      bar.assign(slots, '_');
+    } else {
+      const std::size_t total_chunks = chunk_states.size();
+      auto scaled_position = [total_size, slots](std::size_t idx) -> uint64_t {
+        if(slots == 0) return 0;
+        uint64_t base = (total_size / slots) * idx;
+        uint64_t remainder = (total_size % slots) * idx / slots;
+        return base + remainder;
+      };
+      for(std::size_t slot = 0; slot < slots; ++slot) {
+        uint64_t slot_start = scaled_position(slot);
+        if(slot_start >= total_size) {
+          bar.push_back('_');
+          continue;
+        }
+        uint64_t slot_end = scaled_position(slot + 1);
+        if(slot_end <= slot_start) slot_end = slot_start + 1;
+        if(slot_end > total_size) slot_end = total_size;
+        const uint64_t slot_len = slot_end - slot_start;
+        uint64_t filled = 0;
+        std::size_t chunk_idx = static_cast<std::size_t>(slot_start / chunk_width);
+        if(chunk_idx >= total_chunks) {
+          chunk_idx = total_chunks - 1;
+        }
+        uint64_t chunk_start = static_cast<uint64_t>(chunk_idx) * chunk_width;
+        while(chunk_idx < total_chunks && chunk_start < slot_end) {
+          uint64_t chunk_end = std::min<uint64_t>(chunk_start + chunk_width, total_size);
+          if(chunk_states[chunk_idx]) {
+            uint64_t overlap_start = std::max(slot_start, chunk_start);
+            uint64_t overlap_end = std::min(slot_end, chunk_end);
+            if(overlap_end > overlap_start) {
+              filled += overlap_end - overlap_start;
+            }
+          }
+          ++chunk_idx;
+          chunk_start += chunk_width;
+        }
+        double ratio = slot_len == 0
+          ? 0.0
+          : static_cast<double>(filled) / static_cast<double>(slot_len);
+        char symbol = '_';
+        if(ratio >= 0.999) {
+          symbol = 'X';
+        } else if(ratio >= 0.5) {
+          symbol = 'Y';
+        } else if(ratio > 0.0) {
+          symbol = 'v';
+        }
+        bar.push_back(symbol);
+      }
+    }
+    double percent = total_size == 0
+      ? 100.0
+      : (static_cast<double>(std::min<uint64_t>(downloaded, total_size)) / static_cast<double>(total_size)) * 100.0;
+    std::ostringstream oss;
+    oss << bar << " " << std::fixed << std::setprecision(1) << percent << "%";
+    return oss.str();
+  }
+
+  static bool listing_contains_dir_stub(const std::vector<PeerManager::RemoteListingItem>& items,
+                                        const std::string& guid) {
+    if(guid.empty()) return true;
+    for(const auto& item : items) {
+      if(!item.is_directory) continue;
+      if(item.directory_guid == guid && item.relative_path.empty()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  SourceReachability check_watch_source(const WatchEntry& entry, const WatchEntry::Source& src) const {
+    if(src.peer.empty()) return SourceReachability::Offline;
+    if(src.peer == pm_->local_peer_id()) return SourceReachability::Online;
+    PeerListingResult resp;
+    if(!entry.dir_guid.empty()) {
+      resp = fetch_peer_listing(src.peer, "", "", entry.dir_guid, true);
+    } else {
+      auto normalized = normalize_cli_path(src.path);
+      if(normalized.empty()) return SourceReachability::Online;
+      resp = fetch_peer_listing(src.peer, normalized, "", "", true);
+    }
+    switch(resp.state) {
+      case PeerListingState::Completed:
+        if(!entry.dir_guid.empty()) {
+          return listing_contains_dir_stub(resp.items, entry.dir_guid)
+            ? SourceReachability::Online
+            : SourceReachability::Missing;
+        }
+        return SourceReachability::Online;
+      case PeerListingState::Timeout: return SourceReachability::Timeout;
+      case PeerListingState::NotConnected:
+      default: return SourceReachability::Offline;
+    }
+  }
+
+  std::map<std::string, SourceReachability> gather_watch_peer_status(const WatchEntry& entry) const {
+    std::map<std::string, SourceReachability> status;
+    for(const auto& src : entry.sources) {
+      if(src.peer.empty()) continue;
+      auto reachability = check_watch_source(entry, src);
+      auto it = status.find(src.peer);
+      if(it == status.end()) {
+        status[src.peer] = reachability;
+      } else {
+        auto current_priority = reachability_priority(it->second);
+        auto new_priority = reachability_priority(reachability);
+        if(new_priority > current_priority) {
+          it->second = reachability;
+        }
+      }
+    }
+    return status;
+  }
+
+  static std::string reachability_label(SourceReachability state) {
+    switch(state) {
+      case SourceReachability::Online: return "ok";
+      case SourceReachability::Timeout: return "timeout";
+      case SourceReachability::Missing: return "missing";
+      case SourceReachability::Offline:
+      default: return "down";
+    }
+  }
+
+  static int reachability_priority(SourceReachability state) {
+    switch(state) {
+      case SourceReachability::Online: return 3;
+      case SourceReachability::Timeout: return 2;
+      case SourceReachability::Missing: return 1;
+      case SourceReachability::Offline:
+      default: return 0;
+    }
   }
 
   void notify_untrusted_directory_sources(const std::vector<PeerManager::RemoteListingItem>& entries) {
@@ -1770,7 +2666,7 @@ private:
     std::string action;
     iss >> action;
 
-    bool action_is_known = action == "list" || action == "add" || action == "remove" || action == "interval";
+    bool action_is_known = action == "list" || action == "add" || action == "remove" || action == "interval" || action == "set";
     if(!action_is_known) {
       iss.clear();
       iss.seekg(0);
@@ -1783,7 +2679,7 @@ private:
       std::string source;
       iss >> source;
       if(source.empty()) {
-        std::cout << "Usage: watch add <peer:/path|peer:dir-guid> [dest]\n";
+        std::cout << "Usage: watch add <resource> [dest]\n";
         return;
       }
       std::string dest_raw;
@@ -1795,45 +2691,25 @@ private:
       std::optional<std::string> dest_override;
       if(!dest_raw.empty()) dest_override = normalize_cli_path(dest_raw);
 
-      auto parsed = parse_list_command(source);
-      if(!parsed || (parsed->type != ListCommand::Type::RemotePath && parsed->type != ListCommand::Type::RemoteDirectoryGuid)) {
-        std::cout << "Watch currently supports peer paths or directory GUIDs.\n";
-        return;
-      }
-      if(parsed->peer == pm_->local_peer_id()) {
-        std::cout << "Cannot watch self.\n";
-        return;
-      }
-      if(parsed->type == ListCommand::Type::RemotePath && is_internal_listing_path(parsed->path)) {
-        std::cout << "Cannot watch reserved staging path.\n";
-        return;
-      }
       if(dest_override && is_internal_listing_path(*dest_override)) {
         std::cout << "Cannot sync into reserved staging path.\n";
         return;
       }
 
-      WatchEntry::Source new_source;
-      new_source.peer = parsed->peer;
-      if(parsed->type == ListCommand::Type::RemotePath) {
-        new_source.path = normalize_cli_path(parsed->path);
-      } else {
-        new_source.path.clear();
-      }
-
-      std::optional<ResolvedDirGuid> resolved_guid;
-      if(parsed->type == ListCommand::Type::RemoteDirectoryGuid) {
-        resolved_guid = ResolvedDirGuid{parsed->dir_guid, new_source.peer};
-      } else {
-        resolved_guid = resolve_remote_dir_guid(parsed->peer, new_source.path);
-        if(!resolved_guid) {
-          std::cout << "Unable to determine directory GUID for " << parsed->peer << ":/" << parsed->path << ".\n";
-          std::cout << "Ensure the directory exists and has been indexed on the remote peer.\n";
-          return;
+      std::string parse_error;
+      auto resolved_target = resolve_watch_resource(source, parse_error);
+      if(!resolved_target) {
+        if(!parse_error.empty()) {
+          std::cout << parse_error << "\n";
+        } else {
+          std::cout << "Unable to resolve watch target.\n";
         }
+        return;
       }
+      auto new_source = resolved_target->source;
+      auto resolved_guid = resolved_target->resolved;
 
-      if(resolved_guid->guid.empty()) {
+      if(resolved_guid.guid.empty()) {
         std::cout << "Directory GUID is required to track a watch.\n";
         return;
       }
@@ -1845,12 +2721,12 @@ private:
 
       {
         std::lock_guard<std::mutex> lock(watch_mutex_);
-        WatchEntry* existing = find_watch_by_guid(resolved_guid->guid);
+        WatchEntry* existing = find_watch_by_guid(resolved_guid.guid);
         if(!existing) {
           WatchEntry fresh;
           fresh.id = generate_watch_id();
-          fresh.dir_guid = resolved_guid->guid;
-          fresh.origin_peer = !resolved_guid->origin_peer.empty() ? resolved_guid->origin_peer : new_source.peer;
+          fresh.dir_guid = resolved_guid.guid;
+          fresh.origin_peer = !resolved_guid.origin_peer.empty() ? resolved_guid.origin_peer : new_source.peer;
           fresh.dest_path = dest_override ? *dest_override : "";
           fresh.dest_is_directory = dest_is_dir || fresh.dest_path.empty();
           fresh.interval = default_watch_interval_;
@@ -1889,11 +2765,11 @@ private:
           }
           existing->sources.push_back(new_source);
           existing->next_run = std::chrono::steady_clock::now();
-          if(resolved_guid && existing->dir_guid.empty()) {
-            existing->dir_guid = resolved_guid->guid;
+          if(!resolved_guid.guid.empty() && existing->dir_guid.empty()) {
+            existing->dir_guid = resolved_guid.guid;
           }
-          if(resolved_guid && !resolved_guid->origin_peer.empty()) {
-            existing->origin_peer = resolved_guid->origin_peer;
+          if(!resolved_guid.origin_peer.empty()) {
+            existing->origin_peer = resolved_guid.origin_peer;
           } else if(existing->origin_peer.empty()) {
             existing->origin_peer = existing->sources.front().peer;
           }
@@ -1915,7 +2791,7 @@ private:
           local_root = snapshot.sources.front().path;
         }
         if(!local_root.empty()) {
-          pm_->register_directory_with_guid(local_root, snapshot.dir_guid);
+          remember_dir_guid_mapping(local_root, snapshot.dir_guid);
         }
         if(!snapshot.origin_peer.empty()) {
           pm_->set_directory_origin(snapshot.dir_guid, snapshot.origin_peer);
@@ -1925,7 +2801,7 @@ private:
       save_watches();
       watch_cv_.notify_all();
       if(created) {
-        std::cout << "Added watch " << affected_id << " for " << resolved_guid->guid << ".\n";
+        std::cout << "Added watch " << affected_id << " for " << resolved_guid.guid << ".\n";
       } else {
         std::cout << "Updated watch " << affected_id << " with a new trusted source.\n";
       }
@@ -1935,12 +2811,138 @@ private:
       } else if(result.changed) {
         std::cout << "[watch " << affected_id << "] synced.\n";
       }
+    } else if(action == "set") {
+      std::string id;
+      iss >> id;
+      trim(id);
+      std::string remainder;
+      std::getline(iss, remainder);
+      trim(remainder);
+      if(id.empty() || remainder.empty()) {
+        std::cout << "Usage: watch set <id> <resource> [dest]\n";
+        return;
+      }
+
+      WatchEntry existing_snapshot;
+      {
+        std::lock_guard<std::mutex> lock(watch_mutex_);
+        auto* entry = find_watch_by_id(id);
+        if(!entry) {
+          std::cout << "No watch found with id " << id << ".\n";
+          return;
+        }
+        existing_snapshot = *entry;
+      }
+      if(existing_snapshot.sources.empty()) {
+        std::cout << "Watch " << id << " has no sources to infer defaults from.\n";
+        return;
+      }
+
+      std::istringstream src_stream(remainder);
+      std::string source_token;
+      src_stream >> source_token;
+      if(source_token.empty()) {
+        std::cout << "Usage: watch set <id> <resource> [dest]\n";
+        return;
+      }
+      std::string dest_raw;
+      std::getline(src_stream, dest_raw);
+      trim(dest_raw);
+      bool dest_is_dir = !dest_raw.empty() && dest_raw.back() == '/';
+      if(dest_is_dir) dest_raw.pop_back();
+      trim(dest_raw);
+      std::optional<std::string> dest_override;
+      if(!dest_raw.empty()) dest_override = normalize_cli_path(dest_raw);
+
+      std::string default_peer = !existing_snapshot.origin_peer.empty()
+        ? existing_snapshot.origin_peer
+        : existing_snapshot.sources.front().peer;
+
+      if(dest_override && is_internal_listing_path(*dest_override)) {
+        std::cout << "Cannot sync into reserved staging path.\n";
+        return;
+      }
+
+      std::string parse_error;
+      auto resolved_target = resolve_watch_resource(source_token, parse_error, default_peer);
+      if(!resolved_target) {
+        if(!parse_error.empty()) {
+          std::cout << parse_error << "\n";
+        } else {
+          std::cout << "Unable to resolve watch target.\n";
+        }
+        return;
+      }
+      auto new_source = resolved_target->source;
+      auto resolved_guid = resolved_target->resolved;
+
+      if(resolved_guid.guid.empty()) {
+        std::cout << "Directory GUID is required to track a watch.\n";
+        return;
+      }
+
+      WatchEntry snapshot;
+      {
+        std::lock_guard<std::mutex> lock(watch_mutex_);
+        auto* entry = find_watch_by_id(id);
+        if(!entry) {
+          std::cout << "No watch found with id " << id << ".\n";
+          return;
+        }
+        if(dest_override) {
+          if(entry->dest_path.empty() || entry->dest_path == *dest_override) {
+            entry->dest_path = *dest_override;
+            entry->dest_is_directory = dest_is_dir || entry->dest_path.empty();
+          } else {
+            std::cout << "Watch " << entry->id << " already uses destination "
+                      << entry->dest_path << ". Remove it first to change destinations.\n";
+            return;
+          }
+        }
+        entry->sources.clear();
+        entry->sources.push_back(new_source);
+        entry->dir_guid = resolved_guid.guid;
+        entry->origin_peer = resolved_guid.origin_peer.empty() ? new_source.peer : resolved_guid.origin_peer;
+        entry->next_run = std::chrono::steady_clock::now();
+        snapshot = *entry;
+      }
+
+      if(!snapshot.dir_guid.empty()) {
+        std::string local_root;
+        if(!snapshot.dest_path.empty()) {
+          local_root = snapshot.dest_path;
+        } else if(!snapshot.sources.empty() && !snapshot.sources.front().path.empty()) {
+          local_root = snapshot.sources.front().path;
+        }
+        if(!local_root.empty()) {
+          remember_dir_guid_mapping(local_root, snapshot.dir_guid);
+        }
+        if(!snapshot.origin_peer.empty()) {
+          pm_->set_directory_origin(snapshot.dir_guid, snapshot.origin_peer);
+        }
+      }
+
+      save_watches();
+      watch_cv_.notify_all();
+      std::cout << "Watch " << id << " updated to follow " << new_source.peer;
+      if(!new_source.path.empty()) {
+        std::cout << ":/" << new_source.path;
+      } else {
+        std::cout << ":/" << resolved_guid.guid;
+      }
+      std::cout << ".\n";
+      auto result = run_single_watch(snapshot);
+      if(!result.success) {
+        std::cout << "[watch " << id << "] sync failed.\n";
+      } else if(result.changed) {
+        std::cout << "[watch " << id << "] synced.\n";
+      }
     } else if(action == "remove") {
       std::string id;
       iss >> id;
       trim(id);
       if(id.empty()) {
-        std::cout << "Usage: watch remove <id|dir-guid|peer:/path>\n";
+        std::cout << "Usage: watch remove <id|dir-guid|resource>\n";
         return;
       }
 
@@ -2177,6 +3179,8 @@ private:
       if(settings_->load()) {
         apply_setting_side_effects("audio_notifications");
         apply_setting_side_effects("transfer_debug");
+        apply_setting_side_effects("transfer_progress");
+        apply_setting_side_effects("progress_meter_size");
         std::cout << "Loaded settings from " << settings_->settings_path() << "\n";
       } else {
         std::cout << "Settings file not found; defaults restored.\n";
@@ -2210,6 +3214,20 @@ private:
         if(pm_) {
           pm_->set_transfer_debug(enabled);
         }
+      } catch(...) {
+        // ignore
+      }
+    } else if(key == "transfer_progress") {
+      try {
+        transfer_progress_enabled_ = settings_->get<bool>("transfer_progress");
+      } catch(...) {
+        // ignore
+      }
+    } else if(key == "progress_meter_size") {
+      try {
+        int width = settings_->get<int>("progress_meter_size");
+        width = std::clamp(width, 10, 400);
+        progress_meter_size_ = static_cast<std::size_t>(width);
       } catch(...) {
         // ignore
       }
@@ -2499,6 +3517,257 @@ private:
     return removed;
   }
 
+  void handle_guid_command(const std::string& args) {
+    if(args.empty()) {
+      (void)index_share_root();
+      list_dir_guids(false);
+      return;
+    }
+
+    std::istringstream iss(args);
+    std::string action;
+    iss >> action;
+
+    auto refresh_dir_state = [this](){
+      (void)index_share_root();
+    };
+
+    if(action == "list") {
+      refresh_dir_state();
+      list_dir_guids(false);
+    } else if(action == "orphans") {
+      refresh_dir_state();
+      list_dir_guids(true);
+    } else if(action == "assign") {
+      std::string guid;
+      iss >> guid;
+      std::string path;
+      std::getline(iss, path);
+      trim(path);
+      if(guid.empty() || path.empty()) {
+        std::cout << "Usage: guid assign <guid> <relative-path>\n";
+        return;
+      }
+      assign_dir_guid(guid, path);
+    } else if(action == "forget") {
+      std::string guid;
+      iss >> guid;
+      if(guid.empty()) {
+        std::cout << "Usage: guid forget <guid>\n";
+        return;
+      }
+      forget_dir_guid(guid);
+    } else {
+      std::cout << "Unknown guid command. Usage: guid list|orphans|assign <guid> <path>|forget <guid>\n";
+    }
+  }
+
+  void list_dir_guids(bool orphans_only) {
+    std::vector<DirGuidRecord> entries;
+    {
+      std::lock_guard<std::mutex> lock(dir_guid_mutex_);
+      entries.reserve(dir_guid_records_.size());
+      for(const auto& [guid, record] : dir_guid_records_) {
+        if(orphans_only && record.active) continue;
+        entries.push_back(record);
+      }
+    }
+
+    if(entries.empty()) {
+      if(orphans_only) {
+        std::cout << "No orphaned directory GUIDs.\n";
+      } else {
+        std::cout << "No directory GUIDs recorded yet.\n";
+      }
+      return;
+    }
+
+    std::sort(entries.begin(), entries.end(),
+      [](const DirGuidRecord& a, const DirGuidRecord& b){
+        if(a.active != b.active) return a.active > b.active;
+        if(a.path != b.path) return a.path < b.path;
+        return a.guid < b.guid;
+      });
+
+    std::cout << std::left << std::setw(42) << "GUID"
+              << "  " << std::setw(30) << "PATH" << "  STATUS\n";
+    for(const auto& entry : entries) {
+      std::string path = entry.path.empty() ? "-" : entry.path;
+      std::string status = entry.active ? "present" : "orphan";
+      std::cout << std::left << std::setw(42) << entry.guid
+                << "  " << std::setw(30) << path
+                << "  " << status;
+      if(auto annotation = watch_annotation_for_guid(entry.guid)) {
+        if(annotation->preferred) {
+          std::cout << "  watch:(" << *annotation->preferred << ")";
+          if(annotation->fallback) {
+            std::cout << " fallback:(" << *annotation->fallback << ")";
+          } else if(annotation->fallback_unavailable) {
+            std::cout << " fallback:(unavailable)";
+          }
+        }
+      }
+      std::cout << "\n";
+    }
+    if(!orphans_only && has_orphaned_dir_guids()) {
+      std::cout << "Use 'guid orphans' to view GUIDs whose directories are missing.\n";
+    }
+  }
+
+  void assign_dir_guid(const std::string& guid, const std::string& user_path) {
+    auto normalized = normalize_relative_string(user_path);
+    if(normalized.empty()) {
+      std::cout << "Path must refer to a directory under share/.\n";
+      return;
+    }
+    if(is_internal_listing_path(normalized)) {
+      std::cout << "Cannot assign GUIDs to internal directories.\n";
+      return;
+    }
+    auto absolute = share_root() / normalized;
+    std::error_code ec;
+    if(!std::filesystem::exists(absolute, ec) || !std::filesystem::is_directory(absolute, ec)) {
+      std::cout << normalized << " does not exist or is not a directory.\n";
+      return;
+    }
+
+    std::optional<DirGuidRecord> displaced;
+    {
+      std::lock_guard<std::mutex> lock(dir_guid_mutex_);
+      auto rec_it = dir_guid_records_.find(guid);
+      if(rec_it == dir_guid_records_.end()) {
+        if(!looks_like_dir_guid(guid)) {
+          std::cout << "GUID must look like dir-xxxxxxxx...; received " << guid << "\n";
+          return;
+        }
+        DirGuidRecord record;
+        record.guid = guid;
+        record.active = false;
+        dir_guid_records_[guid] = record;
+        rec_it = dir_guid_records_.find(guid);
+      } else if(rec_it->second.active && !rec_it->second.path.empty()) {
+        auto existing_absolute = share_root() / rec_it->second.path;
+        std::error_code exists_ec;
+        bool still_exists = std::filesystem::exists(existing_absolute, exists_ec) &&
+                            std::filesystem::is_directory(existing_absolute, exists_ec);
+        if(still_exists) {
+          std::cout << "GUID " << guid << " is still attached to '" << rec_it->second.path
+                    << "'. Use 'guid forget " << guid << "' first or move that directory away.\n";
+          return;
+        }
+      }
+      // Remove any existing mapping for this path.
+      auto path_it = dir_guid_by_path_.find(normalized);
+      if(path_it != dir_guid_by_path_.end() && path_it->second != guid) {
+        auto displaced_it = dir_guid_records_.find(path_it->second);
+        if(displaced_it != dir_guid_records_.end()) {
+          displaced_it->second.active = false;
+          displaced = displaced_it->second;
+        }
+        dir_guid_by_path_.erase(path_it);
+      }
+
+      if(!rec_it->second.path.empty()) {
+        dir_guid_by_path_.erase(rec_it->second.path);
+      }
+      rec_it->second.path = normalized;
+      rec_it->second.active = true;
+      dir_guid_by_path_[normalized] = guid;
+      dir_guid_registry_dirty_ = true;
+    }
+
+    pm_->register_directory_with_guid(normalized, guid);
+    save_dir_guid_registry();
+
+    std::cout << "Mapped GUID " << guid << " to " << normalized << ".\n";
+    if(displaced) {
+      std::cout << "Previous GUID " << displaced->guid << " for " << displaced->path
+                << " is now orphaned.\n";
+    }
+  }
+
+  void forget_dir_guid(const std::string& guid) {
+    bool removed = false;
+    {
+      std::lock_guard<std::mutex> lock(dir_guid_mutex_);
+      auto it = dir_guid_records_.find(guid);
+      if(it == dir_guid_records_.end()) {
+        std::cout << "Unknown GUID " << guid << ".\n";
+        return;
+      }
+      if(!it->second.path.empty()) {
+        dir_guid_by_path_.erase(it->second.path);
+      }
+      dir_guid_records_.erase(it);
+      dir_guid_registry_dirty_ = true;
+      removed = true;
+    }
+
+    if(removed) {
+      save_dir_guid_registry();
+      std::cout << "Forgot GUID " << guid << ".\n";
+    }
+  }
+
+  void maybe_suggest_guid_mapping(const std::vector<PeerManager::RemoteListingItem>& items) {
+    const std::string local_peer = pm_->local_peer_id();
+    std::vector<std::string> unguided_dirs;
+    {
+      std::lock_guard<std::mutex> lock(dir_guid_mutex_);
+      for(const auto& item : items) {
+        if(!item.is_directory) continue;
+        if(item.peer_id != local_peer) continue;
+        if(item.relative_path.empty()) continue;
+        if(is_internal_listing_path(item.relative_path)) continue;
+        if(!item.directory_guid.empty()) continue;
+        auto normalized = normalize_relative_string(item.relative_path);
+        if(normalized.empty()) continue;
+        if(dir_guid_by_path_.count(normalized)) continue;
+        unguided_dirs.push_back(normalized);
+      }
+    }
+    if(unguided_dirs.empty()) return;
+
+    auto orphans = orphaned_dir_guids();
+    if(orphans.empty()) return;
+
+    struct Suggestion { std::string guid; std::string path; };
+    std::vector<Suggestion> suggestions;
+    std::unordered_set<std::string> used_guids;
+
+    for(const auto& path : unguided_dirs) {
+      std::string best_guid;
+      auto path_base = basename_for_relative_path(path);
+      for(const auto& orphan : orphans) {
+        if(used_guids.count(orphan.guid)) continue;
+        auto orphan_base = basename_for_relative_path(orphan.path);
+        if(!path_base.empty() && !orphan_base.empty() && path_base == orphan_base) {
+          best_guid = orphan.guid;
+          break;
+        }
+      }
+      if(best_guid.empty()) {
+        for(const auto& orphan : orphans) {
+          if(used_guids.count(orphan.guid)) continue;
+          best_guid = orphan.guid;
+          break;
+        }
+      }
+      if(best_guid.empty()) break;
+      used_guids.insert(best_guid);
+      suggestions.push_back({best_guid, path});
+      if(used_guids.size() == orphans.size()) break;
+    }
+
+    if(suggestions.empty()) return;
+
+    std::cout << "[guid] Detected directories without GUIDs that might match orphaned GUIDs:\n";
+    for(const auto& suggestion : suggestions) {
+      std::cout << "  guid assign " << suggestion.guid << " " << suggestion.path << "\n";
+    }
+    std::cout << "Execute the appropriate command above (or use 'guid orphans') to preserve rename history.\n";
+  }
+
   void remove_conflicts_matching(const std::function<bool(const ConflictEntry&)>& predicate) {
     std::lock_guard<std::mutex> lock(conflict_mutex_);
     for(const auto& entry : conflicts_) {
@@ -2749,6 +4018,10 @@ private:
     }
 
     const std::size_t chunk_size = PeerManager::kMaxChunkSize;
+    const std::size_t total_chunks = static_cast<std::size_t>((file_size + chunk_size - 1) / chunk_size);
+    std::vector<uint8_t> chunk_states(total_chunks, 0);
+    const bool enable_meter = !quiet && pm_ && pm_->transfer_debug_enabled() && total_chunks > 0;
+
     struct ProviderState {
       PeerManager::RemoteListingItem item;
       std::size_t failures = 0;
@@ -2796,6 +4069,7 @@ private:
           continue;
         }
 
+        std::size_t chunk_index = static_cast<std::size_t>(offset / chunk_size);
         out.write(resp.data.data(), static_cast<std::streamsize>(resp.data.size()));
         if(!out) {
           if(!quiet) std::cout << "Failed writing chunk for " << primary.hash << "\n";
@@ -2806,6 +4080,12 @@ private:
         }
 
         offset += resp.data.size();
+        if(enable_meter && chunk_index < chunk_states.size()) {
+          chunk_states[chunk_index] = 1;
+          auto meter = format_transfer_meter(chunk_states, offset, file_size, chunk_size);
+          std::cout << "\rSyncing " << primary.hash.substr(0, 8) << "... " << meter;
+          std::cout.flush();
+        }
         state.failures = 0;
         chunk_ok = true;
       }
@@ -2828,6 +4108,9 @@ private:
       return false;
     }
 
+    if(enable_meter) {
+      std::cout << "\n";
+    }
     return true;
   }
 
@@ -2925,10 +4208,15 @@ private:
     std::cout << "  send <message>                    Broadcast a chat message\n";
     std::cout << "  list|ls|l [peer:/path|hash|all]   List local or remote files\n";
     std::cout << "  share <path>                      Recursively share files (default share/)\n";
-    std::cout << "  sync <peer:/path|hash>            Sync file or directory\n";
-    std::cout << "  watch [list|add|remove|interval]  Manage directory watches\n";
+    std::cout << "  sync <resource>                   Sync file, directory, hash, or watch\n";
+    std::cout << "  sync force <resource>             Delete local copy before syncing\n";
+    std::cout << "  watch [list|add|remove|set|interval]  Manage directory watches\n";
     std::cout << "  settings [list|get|set|save|load] Manage runtime settings\n";
     std::cout << "  ignore [list|add|remove]          Manage persistent ignore rules\n";
+    std::cout << "  guid list                        Show all tracked directory GUIDs\n";
+    std::cout << "  guid orphans                     Show GUIDs whose directories are missing\n";
+    std::cout << "  guid assign <guid> <path>        Map an orphaned GUID to a new directory\n";
+    std::cout << "  guid forget <guid>               Remove a GUID from the registry\n";
     std::cout << "  conflict [list|accept|ignore|stage|view|unstage]  Review or resolve download conflicts\n";
     std::cout << "  bell                              Play notification bell\n";
     std::cout << "  dirs                              Show important directory locations\n";
@@ -2939,9 +4227,10 @@ private:
     std::error_code ec;
     std::filesystem::create_directories(share_root(), ec);
     std::filesystem::create_directories(download_root(), ec);
-    std::filesystem::create_directories(config_root(), ec);
     std::filesystem::create_directories(archive_root(), ec);
     std::filesystem::create_directories(conflict_stage_root(), ec);
+    std::filesystem::create_directories(config_root(), ec);
+    migrate_legacy_config();
   }
 
   std::filesystem::path share_root() const {
@@ -2953,7 +4242,48 @@ private:
   }
 
   std::filesystem::path config_root() const {
+    return std::filesystem::current_path() / ".config";
+  }
+
+  std::filesystem::path legacy_config_root() const {
     return share_root() / ".config";
+  }
+
+  void migrate_legacy_config() {
+    auto legacy = legacy_config_root();
+    auto target = config_root();
+    std::error_code ec;
+    if(legacy == target) return;
+    std::filesystem::create_directories(target, ec);
+
+    auto migrate_file = [&](const std::filesystem::path& src, const std::filesystem::path& dst){
+      if(src == dst) return;
+      if(!std::filesystem::exists(src, ec)) return;
+      if(std::filesystem::exists(dst, ec)) return;
+      std::error_code rename_ec;
+      std::filesystem::rename(src, dst, rename_ec);
+      if(rename_ec) {
+        std::error_code copy_ec;
+        std::filesystem::copy_file(src, dst,
+                                   std::filesystem::copy_options::overwrite_existing, copy_ec);
+        if(!copy_ec) {
+          std::error_code remove_ec;
+          std::filesystem::remove(src, remove_ec);
+        }
+      }
+    };
+
+    if(std::filesystem::exists(legacy, ec)) {
+      static const std::array<const char*, 3> files = {"dir-guids.json", "ignore.json", "watches.json"};
+      for(const auto* name : files) {
+        auto legacy_file = legacy / name;
+        auto target_file = target / name;
+        migrate_file(legacy_file, target_file);
+      }
+    }
+
+    auto legacy_watches_root = std::filesystem::current_path() / "watches.json";
+    migrate_file(legacy_watches_root, target / "watches.json");
   }
 
   std::filesystem::path archive_root() const {
@@ -3197,6 +4527,11 @@ private:
     if(remainder.front() == '/') {
       cmd.type = ListCommand::Type::RemotePath;
       cmd.path = normalize_cli_path(remainder);
+      if(cmd.path.find('/') == std::string::npos && looks_like_dir_guid(cmd.path)) {
+        cmd.type = ListCommand::Type::RemoteDirectoryGuid;
+        cmd.dir_guid = cmd.path;
+        cmd.path.clear();
+      }
       return cmd;
     }
 
@@ -3217,28 +4552,53 @@ private:
     return cmd;
   }
 
-  std::vector<PeerManager::RemoteListingItem> blocking_list_peer(const std::string& peer,
-                                                                 const std::string& path,
-                                                                 const std::string& hash,
-                                                                 const std::string& dir_guid) {
+  PeerListingResult fetch_peer_listing_impl(const std::string& peer,
+                                            const std::string& path,
+                                            const std::string& hash,
+                                            const std::string& dir_guid,
+                                            bool silent) const {
+    PeerListingResult result;
     auto promise = std::make_shared<std::promise<std::vector<PeerManager::RemoteListingItem>>>();
     auto future = promise->get_future();
     bool requested = pm_->request_peer_listing(peer, path, hash, dir_guid,
       [promise](const std::vector<PeerManager::RemoteListingItem>& items){
         promise->set_value(items);
       });
-
     if(!requested) {
-      std::cout << "Peer " << peer << " is not connected.\n";
-      return {};
+      if(!silent) {
+        std::cout << "Peer " << peer << " is not connected.\n";
+      }
+      result.state = PeerListingState::NotConnected;
+      return result;
     }
-
     auto status = future.wait_for(std::chrono::seconds(5));
     if(status != std::future_status::ready) {
-      std::cout << "Timed out waiting for response from " << peer << ".\n";
-      return {};
+      if(!silent) {
+        std::cout << "Timed out waiting for response from " << peer << ".\n";
+      }
+      result.state = PeerListingState::Timeout;
+      return result;
     }
-    return future.get();
+    result.state = PeerListingState::Completed;
+    result.items = future.get();
+    return result;
+  }
+
+  PeerListingResult fetch_peer_listing(const std::string& peer,
+                                       const std::string& path,
+                                       const std::string& hash,
+                                       const std::string& dir_guid,
+                                       bool silent) const {
+    return fetch_peer_listing_impl(peer, path, hash, dir_guid, silent);
+  }
+
+  std::vector<PeerManager::RemoteListingItem> blocking_list_peer(const std::string& peer,
+                                                                 const std::string& path,
+                                                                 const std::string& hash,
+                                                                 const std::string& dir_guid) {
+    auto resp = fetch_peer_listing_impl(peer, path, hash, dir_guid, false);
+    if(resp.state != PeerListingState::Completed) return {};
+    return resp.items;
   }
 
   std::vector<PeerManager::RemoteListingItem> blocking_list_hash(const std::string& hash) {
@@ -3297,6 +4657,7 @@ private:
     filtered.reserve(sorted.size());
     for(const auto& item : sorted) {
       if(is_internal_listing_path(item.relative_path)) continue;
+      if(item.is_directory && item.relative_path.empty()) continue;
       filtered.push_back(item);
     }
 
@@ -3328,12 +4689,27 @@ private:
       std::string size_str = item.is_directory ? "<DIR>" : format_size(item.size);
       if(size_str.size() > size_width) size_str = size_str.substr(0, size_width);
 
+      std::optional<WatchAnnotationDisplay> watch_annotation;
+      bool is_local_entry = item.peer_id == pm_->local_peer_id();
+      if(is_local_entry && item.is_directory && !item.directory_guid.empty()) {
+        watch_annotation = watch_annotation_for_guid(item.directory_guid);
+      }
+
       std::cout << std::left << std::setw(static_cast<int>(id_width)) << id_str << std::right << "  "
                 << std::setw(static_cast<int>(size_width)) << size_str << "  ";
       if(show_peer_prefix) {
         std::cout << item.peer_id << ":";
       }
-      std::cout << display_path << "\n";
+      std::cout << display_path;
+      if(watch_annotation && watch_annotation->preferred) {
+        std::cout << "  watch:(" << *watch_annotation->preferred << ")";
+        if(watch_annotation->fallback) {
+          std::cout << " fallback:(" << *watch_annotation->fallback << ")";
+        } else if(watch_annotation->fallback_unavailable) {
+          std::cout << " fallback:(unavailable)";
+        }
+      }
+      std::cout << "\n";
     }
 
     std::cout.flags(old_flags);
@@ -3350,6 +4726,246 @@ private:
     std::cout << std::filesystem::current_path() << "\n";
   }
 
+  void load_dir_guid_registry() {
+    std::lock_guard<std::mutex> lock(dir_guid_mutex_);
+    dir_guid_records_.clear();
+    dir_guid_by_path_.clear();
+    dir_guid_registry_dirty_ = false;
+
+    auto path = dir_guid_registry_path();
+    if(!std::filesystem::exists(path)) return;
+
+    try {
+      bool pruned_duplicates = false;
+      std::unordered_set<std::string> loaded_paths;
+      std::ifstream in(path);
+      if(!in) return;
+      nlohmann::json doc;
+      in >> doc;
+      auto entries = doc.value("entries", nlohmann::json::array());
+      for(const auto& entry : entries) {
+        DirGuidRecord record;
+        record.guid = entry.value("guid", "");
+        record.path = entry.value("path", "");
+        record.active = entry.value("active", !record.path.empty());
+        if(record.guid.empty()) continue;
+        if(!record.path.empty()) {
+          auto normalized = normalize_cli_path(record.path);
+          if(normalized.empty()) {
+            record.path.clear();
+            record.active = false;
+          } else {
+            record.path = normalized;
+            if(!loaded_paths.insert(record.path).second) {
+              pruned_duplicates = true;
+              continue;
+            }
+          }
+        }
+        if(dir_guid_records_.count(record.guid)) continue;
+        dir_guid_records_[record.guid] = record;
+        if(record.active && !record.path.empty()) {
+          dir_guid_by_path_[record.path] = record.guid;
+        }
+      }
+      if(pruned_duplicates) {
+        dir_guid_registry_dirty_ = true;
+      }
+    } catch(const std::exception& ex) {
+      std::cout << "Failed to load dir-guids.json: " << ex.what() << "\n";
+    }
+  }
+
+  void apply_dir_guid_registry() {
+    std::lock_guard<std::mutex> lock(dir_guid_mutex_);
+    for(const auto& [guid, record] : dir_guid_records_) {
+      if(record.active && !record.path.empty()) {
+        pm_->register_directory_with_guid(record.path, guid);
+      }
+    }
+  }
+
+  void save_dir_guid_registry_locked() {
+    if(!dir_guid_registry_dirty_) return;
+    nlohmann::json doc;
+    doc["entries"] = nlohmann::json::array();
+    for(const auto& [guid, record] : dir_guid_records_) {
+      nlohmann::json item;
+      item["guid"] = guid;
+      item["path"] = record.path;
+      item["active"] = record.active;
+      doc["entries"].push_back(std::move(item));
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(config_root(), ec);
+    try {
+      std::ofstream out(dir_guid_registry_path());
+      if(out) {
+        out << doc.dump(2);
+        dir_guid_registry_dirty_ = false;
+      }
+    } catch(const std::exception& ex) {
+      std::cout << "Failed to save dir-guids.json: " << ex.what() << "\n";
+    }
+  }
+
+  void save_dir_guid_registry() {
+    std::lock_guard<std::mutex> lock(dir_guid_mutex_);
+    save_dir_guid_registry_locked();
+  }
+
+  bool apply_cached_dir_guid(const std::string& relative_path) {
+    if(relative_path.empty()) return true;
+    std::string guid;
+    {
+      std::lock_guard<std::mutex> lock(dir_guid_mutex_);
+      auto it = dir_guid_by_path_.find(relative_path);
+      if(it == dir_guid_by_path_.end()) {
+        return false;
+      }
+      guid = it->second;
+    }
+    pm_->register_directory_with_guid(relative_path, guid);
+    return true;
+  }
+
+  void remember_dir_guid_mapping(const std::string& raw_relative_path,
+                                 const std::string& guid,
+                                 bool ensure_binding = true) {
+    if(raw_relative_path.empty() || guid.empty()) return;
+    auto normalized = normalize_cli_path(raw_relative_path);
+    if(normalized.empty()) return;
+    if(ensure_binding) {
+      pm_->register_directory_with_guid(normalized, guid);
+    }
+
+    std::lock_guard<std::mutex> lock(dir_guid_mutex_);
+    auto current_path_it = dir_guid_by_path_.find(normalized);
+    if(current_path_it != dir_guid_by_path_.end() && current_path_it->second == guid) {
+      auto& record = dir_guid_records_[guid];
+      record.guid = guid;
+      record.path = normalized;
+      record.active = true;
+      return;
+    }
+
+    if(current_path_it != dir_guid_by_path_.end() && current_path_it->second != guid) {
+      auto displaced_it = dir_guid_records_.find(current_path_it->second);
+      if(displaced_it != dir_guid_records_.end()) {
+        dir_guid_records_.erase(displaced_it);
+      }
+      dir_guid_by_path_.erase(current_path_it);
+    }
+
+    DirGuidRecord& record = dir_guid_records_[guid];
+    if(!record.path.empty() && record.path != normalized) {
+      dir_guid_by_path_.erase(record.path);
+    }
+    record.guid = guid;
+    record.path = normalized;
+    record.active = true;
+    dir_guid_by_path_[normalized] = guid;
+    dir_guid_registry_dirty_ = true;
+  }
+
+  void register_directory_path(const std::string& relative_path) {
+    if(relative_path.empty()) return;
+    if(auto watch_guid = watch_guid_for_path(relative_path)) {
+      remember_dir_guid_mapping(relative_path, *watch_guid);
+      return;
+    }
+    if(apply_cached_dir_guid(relative_path)) return;
+
+    pm_->register_directory(relative_path);
+    auto guid_opt = pm_->directory_guid_for_path(relative_path);
+    if(!guid_opt) return;
+
+    remember_dir_guid_mapping(relative_path, *guid_opt, false);
+  }
+
+  std::vector<DirGuidRecord> orphaned_dir_guids() const {
+    std::lock_guard<std::mutex> lock(dir_guid_mutex_);
+    std::vector<DirGuidRecord> out;
+    out.reserve(dir_guid_records_.size());
+    for(const auto& [guid, record] : dir_guid_records_) {
+      if(!record.active) out.push_back(record);
+    }
+    return out;
+  }
+
+  bool has_orphaned_dir_guids() const {
+    std::lock_guard<std::mutex> lock(dir_guid_mutex_);
+    for(const auto& [guid, record] : dir_guid_records_) {
+      if(!record.active) return true;
+    }
+    return false;
+  }
+
+  void print_orphan_hint(const std::vector<DirGuidRecord>& newly_orphaned) {
+    if(newly_orphaned.empty()) return;
+    std::vector<const DirGuidRecord*> filtered;
+    for(const auto& record : newly_orphaned) {
+      if(!record.path.empty() && directory_exists_relative(record.path)) continue;
+      filtered.push_back(&record);
+    }
+    if(filtered.empty()) return;
+    std::cout << "[guid] The following directory GUIDs no longer match on-disk folders:\n";
+    for(const auto* record_ptr : filtered) {
+      const auto& record = *record_ptr;
+      std::cout << "  " << record.guid;
+      if(!record.path.empty()) {
+        std::cout << " (previously '" << record.path << "')";
+      }
+      std::cout << "\n";
+    }
+    std::cout << "Use 'guid assign <guid> <relative-path>' to map a GUID to a new folder, "
+                 "or 'guid orphans' to review the full list.\n";
+  }
+
+  std::vector<DirGuidRecord> reconcile_dir_guid_registry(
+      const std::unordered_set<std::string>& seen_paths,
+      const std::unordered_set<std::string>& watch_guids) {
+    std::vector<DirGuidRecord> newly_orphaned;
+    bool changed = false;
+    {
+      std::lock_guard<std::mutex> lock(dir_guid_mutex_);
+      for(auto& [guid, record] : dir_guid_records_) {
+        bool seen = !record.path.empty() && seen_paths.count(record.path) > 0;
+        if(!seen && watch_guids.count(record.guid) > 0) {
+          seen = true;
+        }
+        if(!seen && directory_exists_relative(record.path)) {
+          seen = true;
+        }
+        if(seen) {
+          if(!record.active) {
+            record.active = true;
+            changed = true;
+          }
+          if(!record.path.empty()) {
+            dir_guid_by_path_[record.path] = guid;
+          }
+        } else {
+          if(record.active) {
+            record.active = false;
+            changed = true;
+          }
+          if(!record.path.empty()) {
+            dir_guid_by_path_.erase(record.path);
+          }
+          newly_orphaned.push_back(record);
+        }
+      }
+      if(changed) {
+        dir_guid_registry_dirty_ = true;
+      }
+    }
+    if(changed) {
+      save_dir_guid_registry();
+    }
+    return newly_orphaned;
+  }
+
   bool is_known_peer(const std::string& peer) const {
     auto arr = pm_->make_peer_list_json();
     for(auto& p : arr) {
@@ -3358,46 +4974,57 @@ private:
     return false;
   }
 
-  void index_share_root() {
-    std::lock_guard<std::mutex> guard(share_index_mutex_);
-    auto root = share_root();
-    std::error_code ec;
-    if(!std::filesystem::exists(root, ec)) return;
-    if(std::filesystem::is_regular_file(root, ec)) {
-      PeerManager::SharedFileEntry existing;
-      auto rel_opt = relative_to_share(root);
-      if(rel_opt && pm_->find_local_file_by_path(*rel_opt, existing)) {
-        std::error_code size_ec;
-        auto size = std::filesystem::file_size(root, size_ec);
-        if(!size_ec && existing.size == size) {
-          return;
-        }
-      }
-      share_single_file(root, false);
-      return;
-    }
-    for(auto it = std::filesystem::recursive_directory_iterator(root, ec);
-        !ec && it != std::filesystem::recursive_directory_iterator(); ++it) {
-      if(it->is_directory()) {
-        auto rel = it->path().lexically_relative(root).generic_string();
-        if(is_internal_listing_path(rel)) {
-          it.disable_recursion_pending();
-          continue;
-        }
-        pm_->register_directory(rel);
-      } else if(it->is_regular_file()) {
-        auto rel = it->path().lexically_relative(root).generic_string();
-        if(is_internal_listing_path(rel)) continue;
+  std::vector<DirGuidRecord> index_share_root() {
+    auto watch_guids = active_watch_guids();
+    {
+      std::lock_guard<std::mutex> guard(share_index_mutex_);
+      auto root = share_root();
+      std::error_code ec;
+      if(!std::filesystem::exists(root, ec)) return {};
+      if(std::filesystem::is_regular_file(root, ec)) {
         PeerManager::SharedFileEntry existing;
-        if(pm_->find_local_file_by_path(rel, existing)) {
+        auto rel_opt = relative_to_share(root);
+        if(rel_opt && pm_->find_local_file_by_path(*rel_opt, existing)) {
           std::error_code size_ec;
-          auto size = std::filesystem::file_size(it->path(), size_ec);
+          auto size = std::filesystem::file_size(root, size_ec);
           if(!size_ec && existing.size == size) {
-            continue;
+            return {};
           }
         }
-        share_single_file(it->path(), false);
+        share_single_file(root, false);
+        return {};
       }
+      std::unordered_set<std::string> seen_dirs;
+
+      for(auto it = std::filesystem::recursive_directory_iterator(root, ec);
+          !ec && it != std::filesystem::recursive_directory_iterator(); ++it) {
+        if(it->is_directory()) {
+          auto rel = it->path().lexically_relative(root).generic_string();
+          if(is_internal_listing_path(rel)) {
+            it.disable_recursion_pending();
+            continue;
+          }
+          auto normalized = normalize_relative_string(rel);
+          register_directory_path(normalized);
+          if(!normalized.empty()) {
+            seen_dirs.insert(normalized);
+          }
+        } else if(it->is_regular_file()) {
+          auto rel = it->path().lexically_relative(root).generic_string();
+          if(is_internal_listing_path(rel)) continue;
+          PeerManager::SharedFileEntry existing;
+          if(pm_->find_local_file_by_path(rel, existing)) {
+            std::error_code size_ec;
+            auto size = std::filesystem::file_size(it->path(), size_ec);
+            if(!size_ec && existing.size == size) {
+              continue;
+            }
+          }
+          share_single_file(it->path(), false);
+        }
+      }
+
+      return reconcile_dir_guid_registry(seen_dirs, watch_guids);
     }
   }
 };

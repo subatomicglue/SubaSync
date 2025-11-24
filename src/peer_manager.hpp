@@ -54,6 +54,7 @@ public:
       bool is_directory = false;
       std::string directory_guid;
       std::string origin_peer;
+      std::string listing_root_path;
     };
 
     struct ChunkResponse {
