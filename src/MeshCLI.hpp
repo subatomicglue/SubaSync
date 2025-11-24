@@ -42,6 +42,7 @@
 #include "peer_manager.hpp"
 #include "utils.hpp"
 #include "settings_manager.hpp"
+#include "swarm_downloader.hpp"
 
 class MeshCLI {
 public:
@@ -60,6 +61,9 @@ public:
     apply_setting_side_effects("transfer_debug");
     apply_setting_side_effects("transfer_progress");
     apply_setting_side_effects("progress_meter_size");
+    apply_setting_side_effects("swarm_max_parallel");
+    apply_setting_side_effects("swarm_chunk_buffers");
+    apply_setting_side_effects("swarm_progress_interval_ms");
     pm_->set_listing_refresh_callback([this](){
       index_share_root();
     });
@@ -111,6 +115,9 @@ private:
   bool audio_notifications_ = false;
   bool transfer_progress_enabled_ = true;
   std::size_t progress_meter_size_ = 80;
+  std::size_t swarm_max_parallel_ = 0;
+  std::size_t swarm_chunk_buffers_ = 1;
+  std::chrono::milliseconds swarm_progress_interval_{200};
   std::chrono::milliseconds chunk_timeout_{10000};
 
   struct WatchEntry {
@@ -1408,118 +1415,90 @@ private:
                                 bool quiet_attempt) -> DownloadAttemptResult {
       if(provider_set.empty()) return DownloadAttemptResult::Failed;
 
-      std::ofstream out(staging_path, std::ios::binary | std::ios::trunc);
+      std::fstream out(staging_path, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
       if(!out) {
         if(!quiet_attempt) std::cout << "Cannot open staging file: " << staging_path << "\n";
         return DownloadAttemptResult::Failed;
       }
-
-      struct ProviderState {
-        PeerManager::RemoteListingItem item;
-        std::size_t failures = 0;
+      if(file_size > 0) {
+        char zero = 0;
+        out.seekp(static_cast<std::streamoff>(file_size - 1));
+        out.write(&zero, 1);
+        out.seekp(0);
+      }
+      std::mutex file_mutex;
+      auto writer = [&](uint64_t offset, const std::vector<char>& data) -> bool {
+        std::lock_guard<std::mutex> lock(file_mutex);
+        out.seekp(static_cast<std::streamoff>(offset));
+        out.write(data.data(), static_cast<std::streamsize>(data.size()));
+        return static_cast<bool>(out);
       };
-
-      std::vector<ProviderState> provider_states;
-      provider_states.reserve(provider_set.size());
-      for(const auto& provider : provider_set) {
-        provider_states.push_back(ProviderState{provider, 0});
+      SwarmConfig swarm_config;
+      swarm_config.chunk_size = chunk_size;
+      swarm_config.total_chunks = total_chunks;
+      swarm_config.max_parallel = swarm_max_parallel_;
+      swarm_config.chunk_buffers = swarm_chunk_buffers_;
+      swarm_config.progress_interval = swarm_progress_interval_;
+      swarm_config.enable_meter = enable_meter && !quiet_attempt;
+      auto fetcher = [&](const std::string& peer_id,
+                         const std::string& hash,
+                         uint64_t offset,
+                         std::size_t length){
+        return fetch_chunk(peer_id, hash, offset, length);
+      };
+      SwarmMeterCallback meter_callback;
+      if(swarm_config.enable_meter) {
+        meter_callback = [&](const std::vector<uint8_t>& states,
+                             uint64_t downloaded,
+                             bool /*force*/){
+          auto meter = format_transfer_meter(states, downloaded, file_size, chunk_size);
+          std::cout << "\rSyncing " << primary.hash.substr(0, 8) << "... " << meter;
+          std::cout.flush();
+        };
       }
-
-      const std::size_t max_failures_per_peer = 3;
-      uint64_t offset = 0;
-      std::size_t cursor = 0;
-
-      while(offset < file_size) {
-        std::size_t request_len = static_cast<std::size_t>(std::min<uint64_t>(chunk_size, file_size - offset));
-        auto active_count = std::count_if(provider_states.begin(), provider_states.end(),
-          [max_failures_per_peer](const ProviderState& state){
-            return state.failures < max_failures_per_peer;
-          });
-        if(active_count == 0) {
-          if(!quiet_attempt) std::cout << "\nNo responsive peers remaining for hash " << primary.hash << "\n";
-          out.close();
-          std::error_code ec;
-          std::filesystem::remove(staging_path, ec);
-          return DownloadAttemptResult::Failed;
-        }
-
-        bool chunk_ok = false;
-        std::size_t attempts = 0;
-        while(attempts < active_count && !chunk_ok) {
-          ProviderState& state = provider_states[cursor];
-          cursor = (cursor + 1) % provider_states.size();
-          if(state.failures >= max_failures_per_peer) continue;
-          ++attempts;
-
-          auto resp = fetch_chunk(state.item.peer_id, primary.hash, offset, request_len);
-          if(!resp.success || resp.data.empty()) {
-            ++state.failures;
-            if(state.failures == max_failures_per_peer && !quiet_attempt) {
-              std::cout << "\nDropping provider " << state.item.peer_id << " after repeated failures.\n";
-            }
-            continue;
-          }
-
-          std::string local_sha = sha256_hex(std::string(resp.data.data(), resp.data.size()));
-          if(!resp.chunk_sha.empty() && resp.chunk_sha != local_sha) {
-            ++state.failures;
-            if(!quiet_attempt) {
-              std::cout << "\nHash mismatch; retrying chunk offset "
-                        << offset << " from " << state.item.peer_id << "\n";
-            }
-            if(state.failures == max_failures_per_peer && !quiet_attempt) {
-              std::cout << "Dropping provider " << state.item.peer_id << " after repeated checksum errors.\n";
-            }
-            continue;
-          }
-
-          std::size_t chunk_index = static_cast<std::size_t>(offset / chunk_size);
-          out.write(resp.data.data(), static_cast<std::streamsize>(resp.data.size()));
-          if(!out) {
-            if(!quiet_attempt) std::cout << "\nFailed writing chunk for " << primary.hash << "\n";
-            out.close();
-            std::error_code ec;
-            std::filesystem::remove(staging_path, ec);
-            return DownloadAttemptResult::Failed;
-          }
-
-          offset += resp.data.size();
-          if(enable_meter && chunk_index < chunk_states.size()) {
-            chunk_states[chunk_index] = 1;
-          }
-          state.failures = 0;
-          if(!quiet_attempt) {
-            if(enable_meter) {
-              auto meter = format_transfer_meter(chunk_states, offset, file_size, chunk_size);
-              std::cout << "\rSyncing " << primary.hash.substr(0, 8) << "... " << meter;
-            } else {
-              double progress = static_cast<double>(offset) / static_cast<double>(file_size) * 100.0;
-              std::cout << "\rSyncing " << primary.hash.substr(0, 8) << "... "
-                        << std::fixed << std::setprecision(1) << progress << "%";
-            }
-            std::cout.flush();
-          }
-          chunk_ok = true;
-        }
-
-        if(!chunk_ok) {
-          if(!quiet_attempt) std::cout << "\nFailed to download chunk for hash " << primary.hash << "\n";
-          out.close();
-          std::error_code ec;
-          std::filesystem::remove(staging_path, ec);
-          return DownloadAttemptResult::Failed;
-        }
-      }
-
-      if(!quiet_attempt) std::cout << "\n";
+      std::string swarm_failure;
+      bool downloaded = run_swarm_download(primary.hash,
+                                           file_size,
+                                           swarm_config,
+                                           provider_set,
+                                           chunk_states,
+                                           fetcher,
+                                           writer,
+                                           meter_callback,
+                                           swarm_failure);
       out.close();
+      if(!downloaded) {
+        if(!quiet_attempt && !swarm_failure.empty()) {
+          std::cout << swarm_failure << "\n";
+        }
+        std::error_code ec;
+        std::filesystem::remove(staging_path, ec);
+        return DownloadAttemptResult::Failed;
+      }
+      if(swarm_config.enable_meter && !quiet_attempt) {
+        std::cout << "\n";
+      }
 
       auto computed_hash = compute_file_hash(staging_path);
-      if(!computed_hash || *computed_hash != primary.hash) {
-        if(!quiet_attempt) std::cout << "File hash mismatch for " << clean_relative << "\n";
+      if(!computed_hash) {
+        if(!quiet_attempt) std::cout << "Failed to compute hash for " << clean_relative << "\n";
         std::error_code ec;
         std::filesystem::remove(staging_path, ec);
         return DownloadAttemptResult::HashMismatch;
+      }
+      if(*computed_hash != primary.hash) {
+        if(!quiet_attempt) {
+          std::cout << "File hash mismatch for " << clean_relative
+                    << " (expected " << primary.hash
+                    << " but got " << *computed_hash << ")\n";
+        }
+        std::error_code ec;
+        std::filesystem::remove(staging_path, ec);
+        return DownloadAttemptResult::HashMismatch;
+      }
+      if(!quiet_attempt) {
+        std::cout << "\nHash verified for " << clean_relative
+                  << " (" << primary.hash << ")\n";
       }
 
       std::error_code ec;
@@ -1814,32 +1793,18 @@ private:
       return;
     }
     for(const auto& entry : snapshot) {
-      std::cout << entry.id << " -> ";
-      bool first = true;
-      for(const auto& src : entry.sources) {
-        if(!first) std::cout << ", ";
-        first = false;
-        std::cout << src.peer << ":/" << (entry.dir_guid.empty() ? src.path : entry.dir_guid);
-      }
-      if(first) std::cout << "(no sources)";
       auto local_label = watch_local_target_label(entry);
-      std::cout << "  local=" << local_label
-                << "  every " << entry.interval.count() << "s";
       auto peer_statuses = gather_watch_peer_status(entry);
-      if(!peer_statuses.empty()) {
-        std::size_t online = 0;
-        for(const auto& kv : peer_statuses) {
-          if(kv.second == SourceReachability::Online) ++online;
-        }
-        std::cout << "  peers=" << online << "/" << peer_statuses.size() << " [";
-        bool first_status = true;
-        for(const auto& kv : peer_statuses) {
-          if(!first_status) std::cout << ", ";
-          first_status = false;
-          std::cout << kv.first << ":" << reachability_label(kv.second);
-        }
-        std::cout << "]";
+      std::size_t online = 0;
+      for(const auto& kv : peer_statuses) {
+        if(kv.second == SourceReachability::Online) ++online;
       }
+      std::size_t total_peers = peer_statuses.size();
+      std::cout << entry.id << " -> "
+                << (entry.dir_guid.empty() ? "(guid unknown)" : entry.dir_guid)
+                << "  local=" << local_label
+                << "  every " << entry.interval.count() << "s"
+                << "  peers=" << online << "/" << total_peers;
       if(!entry.origin_peer.empty()) {
         SourceReachability origin_state = SourceReachability::Offline;
         auto it = peer_statuses.find(entry.origin_peer);
@@ -1854,6 +1819,34 @@ private:
           origin_state = check_watch_source(entry, probe);
         }
         std::cout << "  origin=" << entry.origin_peer << "(" << reachability_label(origin_state) << ")";
+      }
+      std::cout << "\n";
+      if(entry.sources.empty()) {
+        std::cout << "  (no sources)\n";
+        continue;
+      }
+      for(const auto& src : entry.sources) {
+        auto reachability = SourceReachability::Offline;
+        auto it = peer_statuses.find(src.peer);
+        if(it != peer_statuses.end()) {
+          reachability = it->second;
+        }
+        std::cout << "  - " << src.peer;
+        std::string label;
+        if(auto resolved_path = resolve_watch_source_path(entry, src.peer)) {
+          label = *resolved_path;
+        }
+        if(label.empty() && !entry.dir_guid.empty()) {
+          label = entry.dir_guid;
+        }
+        if(!label.empty()) {
+          std::cout << ":/" << label;
+        }
+        std::cout << " (" << reachability_label(reachability) << ")";
+        if(!entry.origin_peer.empty() && src.peer == entry.origin_peer) {
+          std::cout << " [origin]";
+        }
+        std::cout << "\n";
       }
       std::cout << "\n";
     }
@@ -2156,6 +2149,41 @@ private:
       }
     }
     return std::nullopt;
+  }
+
+  std::string canonical_watch_destination(const WatchEntry& entry) const {
+    if(!entry.dest_path.empty()) {
+      return normalize_cli_path(entry.dest_path);
+    }
+    if(auto mapped = active_path_for_guid(entry.dir_guid)) {
+      auto normalized = normalize_cli_path(*mapped);
+      if(!normalized.empty()) return normalized;
+    }
+    for(const auto& src : entry.sources) {
+      if(src.path.empty()) continue;
+      auto normalized = normalize_cli_path(src.path);
+      if(!normalized.empty()) return normalized;
+    }
+    return "";
+  }
+
+  std::string requested_watch_destination(const WatchEntry::Source& source,
+                                          const std::optional<std::string>& dest_override,
+                                          const std::string& guid) const {
+    if(dest_override && !dest_override->empty()) {
+      return normalize_cli_path(*dest_override);
+    }
+    if(!source.path.empty()) {
+      auto normalized = normalize_cli_path(source.path);
+      if(!normalized.empty()) return normalized;
+    }
+    if(!guid.empty()) {
+      if(auto mapped = active_path_for_guid(guid)) {
+        auto normalized = normalize_cli_path(*mapped);
+        if(!normalized.empty()) return normalized;
+      }
+    }
+    return "";
   }
 
   std::optional<std::string> default_peer_for_guid(const std::string& guid) {
@@ -2486,15 +2514,13 @@ private:
         double ratio = slot_len == 0
           ? 0.0
           : static_cast<double>(filled) / static_cast<double>(slot_len);
-        char symbol = '_';
-        if(ratio >= 0.999) {
-          symbol = 'X';
-        } else if(ratio >= 0.5) {
-          symbol = 'Y';
-        } else if(ratio > 0.0) {
-          symbol = 'v';
-        }
-        bar.push_back(symbol);
+        //static constexpr std::array<char, 8> cell_chars = {' ', '_', '-', 'v', 'Y', 'X', 'H', '#'};
+        static constexpr std::array<char, 12> cell_chars = { ' ', '_', '-', '=', 'c', 'u', 'o', 'G', 'O', 'Q', '0', '@' };
+        const double clamped = std::clamp(ratio, 0.0, 1.0);
+        const double scaled = clamped * static_cast<double>(cell_chars.size());
+        std::size_t index = static_cast<std::size_t>(scaled);
+        if(index >= cell_chars.size()) index = cell_chars.size() - 1;
+        bar.push_back(cell_chars[index]);
       }
     }
     double percent = total_size == 0
@@ -2714,6 +2740,7 @@ private:
         return;
       }
 
+      auto requested_local_root = requested_watch_destination(new_source, dest_override, resolved_guid.guid);
       WatchEntry snapshot;
       bool created = false;
       bool updated = false;
@@ -2721,8 +2748,27 @@ private:
 
       {
         std::lock_guard<std::mutex> lock(watch_mutex_);
-        WatchEntry* existing = find_watch_by_guid(resolved_guid.guid);
-        if(!existing) {
+        WatchEntry* target = nullptr;
+        for(auto& entry : watches_) {
+          std::string existing_dest = canonical_watch_destination(entry);
+          if(!requested_local_root.empty() && !existing_dest.empty() &&
+             existing_dest == requested_local_root && entry.dir_guid != resolved_guid.guid) {
+            std::cout << "Local destination " << requested_local_root
+                      << " is already used by watch " << entry.id
+                      << ". Choose a different destination.\n";
+            return;
+          }
+          if(entry.dir_guid == resolved_guid.guid) {
+            bool same_dest = (existing_dest == requested_local_root) ||
+                             (existing_dest.empty() && requested_local_root.empty());
+            if(same_dest) {
+              target = &entry;
+              break;
+            }
+          }
+        }
+
+        if(!target) {
           WatchEntry fresh;
           fresh.id = generate_watch_id();
           fresh.dir_guid = resolved_guid.guid;
@@ -2741,42 +2787,32 @@ private:
             pm_->set_directory_origin(fresh.dir_guid, fresh.origin_peer);
           }
         } else {
-          affected_id = existing->id;
-          if(dest_override) {
-            if(existing->dest_path.empty()) {
-              existing->dest_path = *dest_override;
-              existing->dest_is_directory = dest_is_dir || existing->dest_path.empty();
-            } else if(existing->dest_path != *dest_override) {
-              std::cout << "Watch " << existing->id << " already uses destination "
-                        << existing->dest_path << ". Remove it first to change destinations.\n";
-              return;
-            }
-          }
-          auto dup = std::find_if(existing->sources.begin(), existing->sources.end(),
+          affected_id = target->id;
+          auto dup = std::find_if(target->sources.begin(), target->sources.end(),
             [&](const WatchEntry::Source& src){
               return src.peer == new_source.peer &&
                      normalize_cli_path(src.path) == normalize_cli_path(new_source.path);
             });
-          if(dup != existing->sources.end()) {
-            std::cout << "Watch " << existing->id << " already trusts " << new_source.peer;
+          if(dup != target->sources.end()) {
+            std::cout << "Watch " << target->id << " already trusts " << new_source.peer;
             if(!new_source.path.empty()) std::cout << ":/" << new_source.path;
             std::cout << ".\n";
             return;
           }
-          existing->sources.push_back(new_source);
-          existing->next_run = std::chrono::steady_clock::now();
-          if(!resolved_guid.guid.empty() && existing->dir_guid.empty()) {
-            existing->dir_guid = resolved_guid.guid;
+          target->sources.push_back(new_source);
+          target->next_run = std::chrono::steady_clock::now();
+          if(!resolved_guid.guid.empty() && target->dir_guid.empty()) {
+            target->dir_guid = resolved_guid.guid;
           }
           if(!resolved_guid.origin_peer.empty()) {
-            existing->origin_peer = resolved_guid.origin_peer;
-          } else if(existing->origin_peer.empty()) {
-            existing->origin_peer = existing->sources.front().peer;
+            target->origin_peer = resolved_guid.origin_peer;
+          } else if(target->origin_peer.empty()) {
+            target->origin_peer = target->sources.front().peer;
           }
-          if(!existing->dir_guid.empty() && !existing->origin_peer.empty()) {
-            pm_->set_directory_origin(existing->dir_guid, existing->origin_peer);
+          if(!target->dir_guid.empty() && !target->origin_peer.empty()) {
+            pm_->set_directory_origin(target->dir_guid, target->origin_peer);
           }
-          snapshot = *existing;
+          snapshot = *target;
           updated = true;
         }
       }
@@ -2890,8 +2926,18 @@ private:
           return;
         }
         if(dest_override) {
-          if(entry->dest_path.empty() || entry->dest_path == *dest_override) {
-            entry->dest_path = *dest_override;
+          auto desired_root = *dest_override;
+          for(const auto& other : watches_) {
+            if(other.id == entry->id) continue;
+            auto existing_dest = canonical_watch_destination(other);
+            if(!desired_root.empty() && !existing_dest.empty() && desired_root == existing_dest) {
+              std::cout << "Local destination " << desired_root << " is already used by watch "
+                        << other.id << " (" << other.dir_guid << "). Choose a different destination.\n";
+              return;
+            }
+          }
+          if(entry->dest_path.empty() || entry->dest_path == desired_root) {
+            entry->dest_path = desired_root;
             entry->dest_is_directory = dest_is_dir || entry->dest_path.empty();
           } else {
             std::cout << "Watch " << entry->id << " already uses destination "
@@ -2951,80 +2997,45 @@ private:
       std::vector<std::string> removed_ids;
 
       if(id.find(':') != std::string::npos) {
-        auto parsed = parse_list_command(id);
-        if(!parsed || (parsed->type != ListCommand::Type::RemotePath && parsed->type != ListCommand::Type::RemoteDirectoryGuid)) {
-          std::cout << "Specify a watch source as peer:/path or peer:dir-guid.\n";
+        std::string parse_error;
+        auto resolved_target = resolve_watch_resource(id, parse_error);
+        if(!resolved_target) {
+          if(!parse_error.empty()) {
+            std::cout << parse_error << "\n";
+          } else {
+            std::cout << "Unable to resolve watch target.\n";
+          }
           return;
         }
-
-        std::string normalized_path = parsed->type == ListCommand::Type::RemotePath
-          ? normalize_cli_path(parsed->path)
-          : "";
+        auto target_guid = resolved_target->resolved.guid;
+        if(target_guid.empty()) {
+          std::cout << "Unable to resolve directory GUID for that watch target.\n";
+          return;
+        }
+        auto target_peer = resolved_target->source.peer;
 
         {
           std::lock_guard<std::mutex> lock(watch_mutex_);
           for(auto it = watches_.begin(); it != watches_.end();) {
-            bool modified = false;
-            if(parsed->type == ListCommand::Type::RemoteDirectoryGuid) {
-              if(it->dir_guid != parsed->dir_guid) {
-                ++it;
-                continue;
-              }
-              auto before = it->sources.size();
-              it->sources.erase(std::remove_if(it->sources.begin(), it->sources.end(),
-                [&](const WatchEntry::Source& src){
-                  return src.peer == parsed->peer;
-                }), it->sources.end());
-              modified = before != it->sources.size();
-              if(modified && !it->sources.empty()) {
-                auto origin_found = std::find_if(it->sources.begin(), it->sources.end(),
-                  [&](const WatchEntry::Source& src){
-                    return src.peer == it->origin_peer;
-                  });
-                if(origin_found == it->sources.end()) {
-                  it->origin_peer = it->sources.front().peer;
-                }
-                if(!it->dir_guid.empty() && !it->origin_peer.empty()) {
-                  pm_->set_directory_origin(it->dir_guid, it->origin_peer);
-                }
-              }
-            } else {
-              auto before = it->sources.size();
-              it->sources.erase(std::remove_if(it->sources.begin(), it->sources.end(),
-                [&](const WatchEntry::Source& src){
-                  return src.peer == parsed->peer &&
-                         normalize_cli_path(src.path) == normalized_path;
-                }), it->sources.end());
-              modified = before != it->sources.size();
-              if(modified && !it->sources.empty()) {
-                auto origin_found = std::find_if(it->sources.begin(), it->sources.end(),
-                  [&](const WatchEntry::Source& src){
-                    return src.peer == it->origin_peer;
-                  });
-                if(origin_found == it->sources.end()) {
-                  it->origin_peer = it->sources.front().peer;
-                }
-                if(!it->dir_guid.empty() && !it->origin_peer.empty()) {
-                  pm_->set_directory_origin(it->dir_guid, it->origin_peer);
-                }
-              }
+            if(it->dir_guid != target_guid) {
+              ++it;
+              continue;
             }
-
-            if(modified) {
-              changed = true;
-              if(it->sources.empty()) {
-                removed_ids.push_back(it->id);
-                it = watches_.erase(it);
-                removed_watch = true;
-                continue;
-              }
+            auto peer_present = std::any_of(it->sources.begin(), it->sources.end(),
+              [&](const WatchEntry::Source& src){ return src.peer == target_peer; });
+            if(!peer_present && !target_peer.empty()) {
+              ++it;
+              continue;
             }
-            ++it;
+            removed_ids.push_back(it->id);
+            it = watches_.erase(it);
+            removed_watch = true;
+            changed = true;
           }
         }
 
-        if(!changed && !removed_watch) {
-          std::cout << "No matching watch source found.\n";
+        if(!changed) {
+          std::cout << "No watch found for that source.\n";
           return;
         }
 
@@ -3181,6 +3192,9 @@ private:
         apply_setting_side_effects("transfer_debug");
         apply_setting_side_effects("transfer_progress");
         apply_setting_side_effects("progress_meter_size");
+        apply_setting_side_effects("swarm_max_parallel");
+        apply_setting_side_effects("swarm_chunk_buffers");
+        apply_setting_side_effects("swarm_progress_interval_ms");
         std::cout << "Loaded settings from " << settings_->settings_path() << "\n";
       } else {
         std::cout << "Settings file not found; defaults restored.\n";
@@ -3228,6 +3242,30 @@ private:
         int width = settings_->get<int>("progress_meter_size");
         width = std::clamp(width, 10, 400);
         progress_meter_size_ = static_cast<std::size_t>(width);
+      } catch(...) {
+        // ignore
+      }
+    } else if(key == "swarm_max_parallel") {
+      try {
+        int value = settings_->get<int>("swarm_max_parallel");
+        if(value < 0) value = 0;
+        swarm_max_parallel_ = static_cast<std::size_t>(value);
+      } catch(...) {
+        // ignore
+      }
+    } else if(key == "swarm_chunk_buffers") {
+      try {
+        int value = settings_->get<int>("swarm_chunk_buffers");
+        if(value < 1) value = 1;
+        swarm_chunk_buffers_ = static_cast<std::size_t>(value);
+      } catch(...) {
+        // ignore
+      }
+    } else if(key == "swarm_progress_interval_ms") {
+      try {
+        int value = settings_->get<int>("swarm_progress_interval_ms");
+        if(value < 50) value = 50;
+        swarm_progress_interval_ = std::chrono::milliseconds(value);
       } catch(...) {
         // ignore
       }
@@ -4011,101 +4049,91 @@ private:
     }
 
     ensure_directory_exists(dest_path.parent_path());
-    std::ofstream out(dest_path, std::ios::binary | std::ios::trunc);
+    std::fstream out(dest_path, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
     if(!out) {
       if(!quiet) std::cout << "Cannot open staging file: " << dest_path << "\n";
       return false;
+    }
+    if(file_size > 0) {
+      char zero = 0;
+      out.seekp(static_cast<std::streamoff>(file_size - 1));
+      out.write(&zero, 1);
+      out.seekp(0);
     }
 
     const std::size_t chunk_size = PeerManager::kMaxChunkSize;
     const std::size_t total_chunks = static_cast<std::size_t>((file_size + chunk_size - 1) / chunk_size);
     std::vector<uint8_t> chunk_states(total_chunks, 0);
-    const bool enable_meter = !quiet && pm_ && pm_->transfer_debug_enabled() && total_chunks > 0;
-
-    struct ProviderState {
-      PeerManager::RemoteListingItem item;
-      std::size_t failures = 0;
+    const bool enable_meter = transfer_progress_enabled_ && !quiet && total_chunks > 0;
+    std::mutex file_mutex;
+    auto writer = [&](uint64_t offset, const std::vector<char>& data) -> bool {
+      std::lock_guard<std::mutex> lock(file_mutex);
+      out.seekp(static_cast<std::streamoff>(offset));
+      out.write(data.data(), static_cast<std::streamsize>(data.size()));
+      return static_cast<bool>(out);
     };
-    const std::size_t max_failures_per_peer = 3;
-    std::vector<ProviderState> provider_states;
-    provider_states.reserve(remote_providers.size());
-    for(const auto& provider : remote_providers) {
-      provider_states.push_back(ProviderState{provider, 0});
+    SwarmConfig swarm_config;
+    swarm_config.chunk_size = chunk_size;
+    swarm_config.total_chunks = total_chunks;
+    swarm_config.max_parallel = swarm_max_parallel_;
+    swarm_config.chunk_buffers = swarm_chunk_buffers_;
+    swarm_config.progress_interval = swarm_progress_interval_;
+    swarm_config.enable_meter = enable_meter;
+    auto fetcher = [&](const std::string& peer_id,
+                       const std::string& hash,
+                       uint64_t offset,
+                       std::size_t length){
+      return fetch_chunk(peer_id, hash, offset, length);
+    };
+    SwarmMeterCallback meter_callback;
+    if(enable_meter) {
+      meter_callback = [&](const std::vector<uint8_t>& states,
+                           uint64_t downloaded,
+                           bool /*force*/){
+        auto meter = format_transfer_meter(states, downloaded, file_size, chunk_size);
+        std::cout << "\rStaging " << primary.hash.substr(0, 8) << "... " << meter;
+        std::cout.flush();
+      };
     }
-
-    uint64_t offset = 0;
-    std::size_t cursor = 0;
-    while(offset < file_size) {
-      std::size_t request_len = static_cast<std::size_t>(std::min<uint64_t>(chunk_size, file_size - offset));
-      auto active_count = std::count_if(provider_states.begin(), provider_states.end(),
-        [max_failures_per_peer](const ProviderState& state){
-          return state.failures < max_failures_per_peer;
-        });
-      if(active_count == 0) {
-        if(!quiet) std::cout << "No responsive peers remaining for hash " << primary.hash << "\n";
-        out.close();
-        std::error_code ec;
-        std::filesystem::remove(dest_path, ec);
-        return false;
-      }
-
-      bool chunk_ok = false;
-      std::size_t attempts = 0;
-      while(attempts < active_count && !chunk_ok) {
-        ProviderState& state = provider_states[cursor];
-        cursor = (cursor + 1) % provider_states.size();
-        if(state.failures >= max_failures_per_peer) continue;
-        ++attempts;
-
-        auto resp = fetch_chunk(state.item.peer_id, primary.hash, offset, request_len);
-        if(!resp.success || resp.data.empty()) {
-          ++state.failures;
-          continue;
-        }
-
-        std::string local_sha = sha256_hex(std::string(resp.data.data(), resp.data.size()));
-        if(!resp.chunk_sha.empty() && resp.chunk_sha != local_sha) {
-          ++state.failures;
-          continue;
-        }
-
-        std::size_t chunk_index = static_cast<std::size_t>(offset / chunk_size);
-        out.write(resp.data.data(), static_cast<std::streamsize>(resp.data.size()));
-        if(!out) {
-          if(!quiet) std::cout << "Failed writing chunk for " << primary.hash << "\n";
-          out.close();
-          std::error_code ec;
-          std::filesystem::remove(dest_path, ec);
-          return false;
-        }
-
-        offset += resp.data.size();
-        if(enable_meter && chunk_index < chunk_states.size()) {
-          chunk_states[chunk_index] = 1;
-          auto meter = format_transfer_meter(chunk_states, offset, file_size, chunk_size);
-          std::cout << "\rSyncing " << primary.hash.substr(0, 8) << "... " << meter;
-          std::cout.flush();
-        }
-        state.failures = 0;
-        chunk_ok = true;
-      }
-
-      if(!chunk_ok) {
-        if(!quiet) std::cout << "Failed to download chunk for hash " << primary.hash << "\n";
-        out.close();
-        std::error_code ec;
-        std::filesystem::remove(dest_path, ec);
-        return false;
-      }
-    }
-
+    std::string failure_reason;
+    bool downloaded = run_swarm_download(primary.hash,
+                                         file_size,
+                                         swarm_config,
+                                         remote_providers,
+                                         chunk_states,
+                                         fetcher,
+                                         writer,
+                                         meter_callback,
+                                         failure_reason);
     out.close();
-    auto computed_hash = compute_file_hash(dest_path);
-    if(!computed_hash || *computed_hash != primary.hash) {
-      if(!quiet) std::cout << "File hash mismatch for staged download " << dest_path << "\n";
+    if(!downloaded) {
+      if(!quiet && !failure_reason.empty()) {
+        std::cout << failure_reason << "\n";
+      }
       std::error_code ec;
       std::filesystem::remove(dest_path, ec);
       return false;
+    }
+
+    auto computed_hash = compute_file_hash(dest_path);
+    if(!computed_hash) {
+      if(!quiet) std::cout << "Failed to compute hash for staged download " << dest_path << "\n";
+      std::error_code ec;
+      std::filesystem::remove(dest_path, ec);
+      return false;
+    }
+    if(*computed_hash != primary.hash) {
+      if(!quiet) {
+        std::cout << "File hash mismatch for staged download " << dest_path
+                  << " (expected " << primary.hash
+                  << " but got " << *computed_hash << ")\n";
+      }
+      std::error_code ec;
+      std::filesystem::remove(dest_path, ec);
+      return false;
+    }
+    if(!quiet) {
+      std::cout << "\nHash verified for staged download (" << primary.hash << ")\n";
     }
 
     if(enable_meter) {

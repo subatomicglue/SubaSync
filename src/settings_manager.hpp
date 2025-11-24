@@ -27,6 +27,9 @@ inline const nlohmann::json SETTINGS_SPECIFICATION = nlohmann::json::array({
   {{"key","transfer_debug"},      {"aliases", {"transfer","td"}},  {"type","bool"},   {"default",false},     {"description","Log chunk send/receive activity"}, {"persistent", true}},
   {{"key","transfer_progress"},   {"aliases", {"progress","tp"}}, {"type","bool"},   {"default",true},      {"description","Show ASCII progress meter during downloads"}, {"persistent", true}},
   {{"key","progress_meter_size"}, {"aliases", {"meter","meter_size","pms"}}, {"type","int"}, {"default",80}, {"description","Number of characters used for the transfer progress meter"}, {"persistent", true}},
+  {{"key","swarm_max_parallel"},  {"aliases", {"swarm_parallel","smp"}}, {"type","int"}, {"default",0}, {"description","Maximum peers to download from in parallel (0 = all)"}, {"persistent", true}},
+  {{"key","swarm_chunk_buffers"}, {"aliases", {"swarm_buffers","scb"}}, {"type","int"}, {"default",1}, {"description","Buffered chunks per swarm peer"}, {"persistent", true}},
+  {{"key","swarm_progress_interval_ms"}, {"aliases", {"swarm_meter_interval","spim"}}, {"type","int"}, {"default",200}, {"description","Minimum milliseconds between swarm progress updates"}, {"persistent", true}},
   {{"key","help"},                {"aliases", {"h","?"}},          {"type","bool"},   {"default",false},     {"description","Show command help and exit"}, {"persistent", false}},
   {{"key","save"},                {"aliases", {"persist"}},        {"type","bool"},   {"default",false},     {"description","Persist current settings to disk"}, {"persistent", false}}
 });

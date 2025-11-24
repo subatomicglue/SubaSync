@@ -1,8 +1,10 @@
 #!/bin/bash
 # Run three sync nodes in separate Terminal windows on macOS
 SYNC_DIR="$(pwd)/build/Release"
-TERMINAL_COLUMNS="${TERMINAL_COLUMNS:-160}"
+TERMINAL_COLUMNS="${TERMINAL_COLUMNS:-180}"
 TERMINAL_ROWS="${TERMINAL_ROWS:-20}"
+PIXEL_X_OFFSET=1300
+PIXEL_Y_OFFSET=600
 
 WINDOW_Y_OFFSET=0
 
@@ -33,7 +35,7 @@ tell application "Terminal"
     set winHeight to (y2 - y1)
 
     -- Stack windows vertically using offset from bash
-    set bounds of w to {0, ${WINDOW_Y_OFFSET}, winWidth, ${WINDOW_Y_OFFSET} + winHeight}
+    set bounds of w to {${PIXEL_X_OFFSET}, ${PIXEL_Y_OFFSET} + ${WINDOW_Y_OFFSET}, ${PIXEL_X_OFFSET} + winWidth, ${PIXEL_Y_OFFSET} + ${WINDOW_Y_OFFSET} + winHeight}
 
     return winHeight
 end tell

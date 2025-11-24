@@ -23,6 +23,7 @@ add_executable(sync
     src/protocol.cpp
     src/utils.cpp
     src/log.cpp
+    src/swarm_downloader.cpp
 )
 
 target_include_directories(sync PRIVATE src)
