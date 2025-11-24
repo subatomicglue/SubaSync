@@ -33,7 +33,8 @@ bool run_swarm_download(const std::string& hash,
                         const SwarmChunkFetcher& fetch_chunk,
                         const SwarmChunkWriter& write_chunk,
                         const SwarmMeterCallback& meter_callback,
-                        std::string& failure_reason) {
+                        std::string& failure_reason,
+                        const SwarmPeerProvider& refresh_providers) {
   if(file_size == 0 || providers.empty()) return false;
   if(!fetch_chunk || !write_chunk) return false;
 
@@ -65,13 +66,7 @@ bool run_swarm_download(const std::string& hash,
   const std::size_t max_parallel = (config.max_parallel == 0)
     ? std::numeric_limits<std::size_t>::max()
     : config.max_parallel;
-  for(const auto& peer : swarm_peers) {
-    for(std::size_t i = 0; i < buffers_per_peer && peer_slots.size() < max_parallel; ++i) {
-      peer_slots.push_back(PeerSlot{peer, false});
-    }
-    if(peer_slots.size() >= max_parallel) break;
-  }
-  if(peer_slots.empty()) return false;
+  std::unordered_set<std::string> known_peers(swarm_peers.begin(), swarm_peers.end());
 
   struct JobState {
     std::size_t attempts = 0;
@@ -88,6 +83,31 @@ bool run_swarm_download(const std::string& hash,
 
   std::mutex peer_mutex;
   std::condition_variable peer_cv;
+
+  auto add_peer_slots_locked = [&](const std::string& peer_id) -> bool {
+    if(peer_id.empty()) return false;
+    if(peer_slots.size() >= max_parallel) return false;
+    std::size_t existing = 0;
+    for(const auto& slot : peer_slots) {
+      if(slot.peer_id == peer_id) ++existing;
+    }
+    bool added = false;
+    while(existing < buffers_per_peer && peer_slots.size() < max_parallel) {
+      peer_slots.push_back(PeerSlot{peer_id, false});
+      ++existing;
+      added = true;
+    }
+    return added;
+  };
+
+  {
+    std::lock_guard<std::mutex> lock(peer_mutex);
+    for(const auto& peer : swarm_peers) {
+      add_peer_slots_locked(peer);
+      if(peer_slots.size() >= max_parallel) break;
+    }
+  }
+  if(peer_slots.empty()) return false;
 
   std::mutex progress_mutex;
   uint64_t downloaded_bytes = 0;
@@ -107,6 +127,38 @@ bool run_swarm_download(const std::string& hash,
       while(!meter_stop.load()) {
         std::this_thread::sleep_for(meter_interval);
         emit_meter(true);
+      }
+    });
+  }
+
+  std::atomic<bool> refresh_stop{false};
+  std::thread refresh_thread;
+  if(refresh_providers && config.enable_dynamic_providers && config.provider_refresh_interval.count() > 0) {
+    auto refresh_interval = config.provider_refresh_interval;
+    refresh_thread = std::thread([&, refresh_interval](){
+      while(!refresh_stop.load()) {
+        auto latest = refresh_providers();
+        bool notify = false;
+        {
+          std::lock_guard<std::mutex> lock(peer_mutex);
+          for(const auto& peer : latest) {
+            if(peer.empty()) continue;
+            if(!known_peers.insert(peer).second) continue;
+            if(add_peer_slots_locked(peer)) {
+              notify = true;
+            }
+          }
+        }
+        if(notify) {
+          peer_cv.notify_all();
+        }
+        auto sleep_interval = refresh_interval.count() > 0
+          ? refresh_interval
+          : std::chrono::milliseconds(1500);
+        auto deadline = std::chrono::steady_clock::now() + sleep_interval;
+        while(!refresh_stop.load() && std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
       }
     });
   }
@@ -236,6 +288,8 @@ bool run_swarm_download(const std::string& hash,
   }
   meter_stop = true;
   if(meter_thread.joinable()) meter_thread.join();
+  refresh_stop = true;
+  if(refresh_thread.joinable()) refresh_thread.join();
 
   if(failure) {
     if(failure_reason.empty()) {

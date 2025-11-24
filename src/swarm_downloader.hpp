@@ -15,6 +15,8 @@ struct SwarmConfig {
   std::size_t chunk_buffers = 1;
   std::chrono::milliseconds progress_interval{200};
   bool enable_meter = false;
+  bool enable_dynamic_providers = false;
+  std::chrono::milliseconds provider_refresh_interval{1500};
 };
 
 using SwarmChunkFetcher = std::function<PeerManager::ChunkResponse(
@@ -29,6 +31,8 @@ using SwarmMeterCallback = std::function<void(const std::vector<uint8_t>& chunk_
                                               uint64_t downloaded_bytes,
                                               bool force)>;
 
+using SwarmPeerProvider = std::function<std::vector<std::string>()>;
+
 bool run_swarm_download(const std::string& hash,
                         uint64_t file_size,
                         const SwarmConfig& config,
@@ -37,4 +41,5 @@ bool run_swarm_download(const std::string& hash,
                         const SwarmChunkFetcher& fetch_chunk,
                         const SwarmChunkWriter& write_chunk,
                         const SwarmMeterCallback& meter_callback,
-                        std::string& failure_reason);
+                        std::string& failure_reason,
+                        const SwarmPeerProvider& refresh_providers = {});
