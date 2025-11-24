@@ -111,8 +111,9 @@ public:
                               uint64_t size);
 
     void register_directory(const std::string& relative_path);
-    void register_directory_with_guid(const std::string& relative_path,
-                                      const std::string& guid);
+  void register_directory_with_guid(const std::string& relative_path,
+                                    const std::string& guid);
+  void unregister_directory_guid(const std::string& guid);
 
     bool find_local_file_by_hash(const std::string& hash, SharedFileEntry& out_entry);
     bool find_local_file_by_path(const std::string& relative_path,

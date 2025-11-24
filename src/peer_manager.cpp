@@ -382,6 +382,22 @@ void PeerManager::register_directory_with_guid(const std::string& relative_path,
   dir_guid_to_path_[guid] = normalized;
 }
 
+void PeerManager::unregister_directory_guid(const std::string& guid) {
+  if(guid.empty()) return;
+  std::lock_guard lg(m_);
+  auto it = dir_guid_to_path_.find(guid);
+  if(it == dir_guid_to_path_.end()) return;
+  auto path = it->second;
+  dir_guid_to_path_.erase(it);
+  dir_guid_origin_.erase(guid);
+  if(!path.empty()) {
+    auto path_it = path_to_dir_guid_.find(path);
+    if(path_it != path_to_dir_guid_.end() && path_it->second == guid) {
+      path_to_dir_guid_.erase(path_it);
+    }
+  }
+}
+
 void PeerManager::set_directory_origin(const std::string& guid, const std::string& origin_peer){
   if(guid.empty()) return;
   std::lock_guard lg(m_);

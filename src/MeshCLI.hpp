@@ -1419,6 +1419,8 @@ private:
       }
     }
 
+    auto download_start = std::chrono::steady_clock::now();
+
     auto attempt_download = [&](const std::vector<PeerManager::RemoteListingItem>& provider_set,
                                 bool quiet_attempt) -> DownloadAttemptResult {
       if(provider_set.empty()) return DownloadAttemptResult::Failed;
@@ -1558,8 +1560,11 @@ private:
 
       std::string registered_path = clean_relative.generic_string();
       pm_->register_local_share(primary.hash, registered_path, final_path, file_size);
+      auto elapsed = std::chrono::steady_clock::now() - download_start;
+      auto elapsed_label = format_duration_compact(elapsed);
       if(!quiet_attempt) {
-        std::cout << "Synced " << clean_relative << " (" << format_size(file_size) << ")\n";
+        std::cout << "Synced " << clean_relative << " (" << format_size(file_size)
+                  << ") in " << elapsed_label << "\n";
       }
       outcome.changed = true;
       return DownloadAttemptResult::Success;
@@ -2570,6 +2575,31 @@ private:
       : (static_cast<double>(std::min<uint64_t>(downloaded, total_size)) / static_cast<double>(total_size)) * 100.0;
     std::ostringstream oss;
     oss << bar << " " << std::fixed << std::setprecision(1) << percent << "%";
+    return oss.str();
+  }
+
+  static std::string format_duration_compact(std::chrono::steady_clock::duration elapsed) {
+    double seconds = std::chrono::duration<double>(elapsed).count();
+    double value = seconds;
+    char unit = 's';
+    if(value >= 60.0) {
+      value /= 60.0;
+      unit = 'm';
+      if(value >= 60.0) {
+        value /= 60.0;
+        unit = 'h';
+        if(value >= 24.0) {
+          value /= 24.0;
+          unit = 'd';
+        }
+      }
+    }
+    std::ostringstream oss;
+    if(value >= 10.0) {
+      oss << std::fixed << std::setprecision(0) << value << unit;
+    } else {
+      oss << std::fixed << std::setprecision(1) << value << unit;
+    }
     return oss.str();
   }
 
@@ -3814,6 +3844,7 @@ private:
     }
 
     if(removed) {
+      pm_->unregister_directory_guid(guid);
       save_dir_guid_registry();
       std::cout << "Forgot GUID " << guid << ".\n";
     }
