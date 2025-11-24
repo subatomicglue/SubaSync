@@ -34,7 +34,9 @@ bool run_swarm_download(const std::string& hash,
                         const SwarmChunkWriter& write_chunk,
                         const SwarmMeterCallback& meter_callback,
                         std::string& failure_reason,
-                        const SwarmPeerProvider& refresh_providers) {
+                        const SwarmPeerProvider& refresh_providers,
+                        SwarmPeerStatsMap* peer_stats,
+                        const std::shared_ptr<std::atomic<std::size_t>>& active_peer_count) {
   if(file_size == 0 || providers.empty()) return false;
   if(!fetch_chunk || !write_chunk) return false;
 
@@ -60,13 +62,31 @@ bool run_swarm_download(const std::string& hash,
     std::shuffle(chunk_order.begin(), chunk_order.end(), rng);
   }
 
-  std::vector<PeerSlot> peer_slots;
-  peer_slots.reserve(swarm_peers.size());
-  const std::size_t buffers_per_peer = std::max<std::size_t>(1, config.chunk_buffers);
-  const std::size_t max_parallel = (config.max_parallel == 0)
-    ? std::numeric_limits<std::size_t>::max()
-    : config.max_parallel;
+  struct PeerState {
+    std::string peer_id;
+    std::size_t outstanding = 0;
+  };
+
+  using PeerStatePtr = std::shared_ptr<PeerState>;
+
+  std::vector<PeerStatePtr> peer_states;
+  peer_states.reserve(swarm_peers.size());
   std::unordered_set<std::string> known_peers(swarm_peers.begin(), swarm_peers.end());
+  const std::size_t per_peer_limit = std::max<std::size_t>(1, config.chunk_buffers);
+  if(peer_stats) {
+    for(const auto& peer : swarm_peers) {
+      (*peer_stats)[peer];
+    }
+  }
+  for(const auto& peer : swarm_peers) {
+    if(peer.empty()) continue;
+    peer_states.push_back(std::make_shared<PeerState>(PeerState{peer, 0}));
+  }
+  if(peer_states.empty()) return false;
+
+  std::size_t worker_count = config.max_parallel == 0
+    ? peer_states.size()
+    : std::max<std::size_t>(1, config.max_parallel);
 
   struct JobState {
     std::size_t attempts = 0;
@@ -81,36 +101,58 @@ bool run_swarm_download(const std::string& hash,
   bool shutting_down = false;
   bool failure = false;
 
-  std::mutex peer_mutex;
-  std::condition_variable peer_cv;
+  std::mutex peer_capacity_mutex;
+  std::condition_variable peer_capacity_cv;
+  std::atomic<std::size_t> next_peer_index{0};
 
-  auto add_peer_slots_locked = [&](const std::string& peer_id) -> bool {
-    if(peer_id.empty()) return false;
-    if(peer_slots.size() >= max_parallel) return false;
-    std::size_t existing = 0;
-    for(const auto& slot : peer_slots) {
-      if(slot.peer_id == peer_id) ++existing;
+  auto add_peer_state = [&](const std::string& peer_id) {
+    if(peer_id.empty()) return;
+    {
+      std::lock_guard<std::mutex> lock(peer_capacity_mutex);
+      auto exists = std::any_of(peer_states.begin(), peer_states.end(),
+        [&](const PeerStatePtr& state){ return state && state->peer_id == peer_id; });
+      if(exists) return;
+      peer_states.push_back(std::make_shared<PeerState>(PeerState{peer_id, 0}));
+      if(peer_stats) (*peer_stats)[peer_id];
     }
-    bool added = false;
-    while(existing < buffers_per_peer && peer_slots.size() < max_parallel) {
-      peer_slots.push_back(PeerSlot{peer_id, false});
-      ++existing;
-      added = true;
-    }
-    return added;
+    peer_capacity_cv.notify_all();
   };
 
-  {
-    std::lock_guard<std::mutex> lock(peer_mutex);
-    for(const auto& peer : swarm_peers) {
-      add_peer_slots_locked(peer);
-      if(peer_slots.size() >= max_parallel) break;
+  auto acquire_peer_state = [&]() -> PeerStatePtr {
+    std::unique_lock<std::mutex> lock(peer_capacity_mutex);
+    peer_capacity_cv.wait(lock, [&]{
+      if(shutting_down || failure) return true;
+      for(const auto& state : peer_states) {
+        if(state && state->outstanding < per_peer_limit) return true;
+      }
+      return false;
+    });
+    if(shutting_down || failure) return nullptr;
+    std::size_t start = next_peer_index.load(std::memory_order_relaxed);
+    for(std::size_t i = 0; i < peer_states.size(); ++i) {
+      std::size_t idx = (start + i) % peer_states.size();
+      auto& state = peer_states[idx];
+      if(state && state->outstanding < per_peer_limit) {
+        state->outstanding++;
+        next_peer_index.store((idx + 1) % peer_states.size(), std::memory_order_relaxed);
+        return state;
+      }
     }
-  }
-  if(peer_slots.empty()) return false;
+    return nullptr;
+  };
+
+  auto release_peer_state = [&](const PeerStatePtr& state){
+    if(!state) return;
+    {
+      std::lock_guard<std::mutex> lock(peer_capacity_mutex);
+      if(state->outstanding > 0) --state->outstanding;
+    }
+    peer_capacity_cv.notify_all();
+  };
 
   std::mutex progress_mutex;
   uint64_t downloaded_bytes = 0;
+  std::mutex stats_mutex;
   auto meter_interval = config.progress_interval.count() > 0
     ? config.progress_interval
     : std::chrono::milliseconds(200);
@@ -138,19 +180,10 @@ bool run_swarm_download(const std::string& hash,
     refresh_thread = std::thread([&, refresh_interval](){
       while(!refresh_stop.load()) {
         auto latest = refresh_providers();
-        bool notify = false;
-        {
-          std::lock_guard<std::mutex> lock(peer_mutex);
-          for(const auto& peer : latest) {
-            if(peer.empty()) continue;
-            if(!known_peers.insert(peer).second) continue;
-            if(add_peer_slots_locked(peer)) {
-              notify = true;
-            }
-          }
-        }
-        if(notify) {
-          peer_cv.notify_all();
+        for(const auto& peer : latest) {
+          if(peer.empty()) continue;
+          if(!known_peers.insert(peer).second) continue;
+          add_peer_state(peer);
         }
         auto sleep_interval = refresh_interval.count() > 0
           ? refresh_interval
@@ -190,34 +223,7 @@ bool run_swarm_download(const std::string& hash,
       if(shutting_down || failure) job_queue.clear();
     }
     job_cv.notify_all();
-    peer_cv.notify_all();
-  };
-
-  auto acquire_peer = [&]() -> std::optional<std::size_t> {
-    std::unique_lock<std::mutex> lock(peer_mutex);
-    peer_cv.wait(lock, [&]{
-      if(failure || shutting_down) return true;
-      for(const auto& slot : peer_slots) {
-        if(!slot.busy) return true;
-      }
-      return false;
-    });
-    if(failure || shutting_down) return std::nullopt;
-    for(std::size_t i = 0; i < peer_slots.size(); ++i) {
-      if(!peer_slots[i].busy) {
-        peer_slots[i].busy = true;
-        return i;
-      }
-    }
-    return std::nullopt;
-  };
-
-  auto release_peer = [&](std::size_t index){
-    {
-      std::lock_guard<std::mutex> lock(peer_mutex);
-      peer_slots[index].busy = false;
-    }
-    peer_cv.notify_one();
+    peer_capacity_cv.notify_all();
   };
 
   auto worker_fn = [&](std::size_t /*worker_id*/){
@@ -226,27 +232,26 @@ bool run_swarm_download(const std::string& hash,
       auto job_opt = take_job();
       if(!job_opt) break;
       std::size_t job_index = *job_opt;
-      auto peer_slot = acquire_peer();
-      if(!peer_slot) {
+      auto peer_state = acquire_peer_state();
+      if(!peer_state) {
         requeue_job(job_index, "Swarm shutdown", true);
         break;
       }
-      std::size_t peer_index = *peer_slot;
-      std::string peer_id = peer_slots[peer_index].peer_id;
+      std::string peer_id = peer_state->peer_id;
       uint64_t offset = static_cast<uint64_t>(job_index) * config.chunk_size;
       auto length = static_cast<std::size_t>(std::min<uint64_t>(config.chunk_size, file_size - offset));
       auto resp = fetch_chunk(peer_id, hash, offset, length);
-      release_peer(peer_index);
+      release_peer_state(peer_state);
       if(!resp.success || resp.data.empty()) {
         job_states[job_index].attempts++;
-        bool fatal = job_states[job_index].attempts >= std::max<std::size_t>(3, peer_slots.size() * 2);
+        bool fatal = job_states[job_index].attempts >= std::max<std::size_t>(3, peer_states.size() * 2);
         requeue_job(job_index, "Failed to download chunk", fatal);
         continue;
       }
       std::string local_sha = sha256_hex(std::string(resp.data.data(), resp.data.size()));
       if(!resp.chunk_sha.empty() && resp.chunk_sha != local_sha) {
         job_states[job_index].attempts++;
-        bool fatal = job_states[job_index].attempts >= std::max<std::size_t>(3, peer_slots.size() * 2);
+        bool fatal = job_states[job_index].attempts >= std::max<std::size_t>(3, peer_states.size() * 2);
         requeue_job(job_index, "Chunk checksum mismatch", fatal);
         continue;
       }
@@ -258,6 +263,17 @@ bool run_swarm_download(const std::string& hash,
         std::lock_guard<std::mutex> lock(progress_mutex);
         if(job_index < chunk_states.size()) chunk_states[job_index] = 1;
         downloaded_bytes += resp.data.size();
+        bool first_chunk_from_peer = false;
+        if(peer_stats) {
+          std::lock_guard<std::mutex> stats_lock(stats_mutex);
+          auto& stat = (*peer_stats)[peer_id];
+          if(stat.bytes == 0) first_chunk_from_peer = true;
+          stat.chunks += 1;
+          stat.bytes += resp.data.size();
+        }
+        if(first_chunk_from_peer && active_peer_count) {
+          active_peer_count->fetch_add(1, std::memory_order_relaxed);
+        }
       }
       emit_meter(false);
 
@@ -273,14 +289,14 @@ bool run_swarm_download(const std::string& hash,
       }
       if(finished) {
         job_cv.notify_all();
-        peer_cv.notify_all();
+        peer_capacity_cv.notify_all();
       }
     }
   };
 
   std::vector<std::thread> workers;
-  workers.reserve(peer_slots.size());
-  for(std::size_t i = 0; i < peer_slots.size(); ++i) {
+  workers.reserve(worker_count);
+  for(std::size_t i = 0; i < worker_count; ++i) {
     workers.emplace_back(worker_fn, i);
   }
   for(auto& thread : workers) {

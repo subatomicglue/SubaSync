@@ -1216,6 +1216,16 @@ private:
         outcome.success = false;
         continue;
       }
+      if(pm_ && pm_->transfer_debug_enabled()) {
+        std::cout << "[swarm] providers for " << hash.substr(0, 8) << ": ";
+        bool first = true;
+        for(const auto& provider : task.providers) {
+          if(!first) std::cout << ", ";
+          first = false;
+          std::cout << provider.peer_id;
+        }
+        std::cout << "\n";
+      }
       auto file_result = download_file_from_providers(task.primary, task.providers, task.dest_relative, quiet, watch_context);
       outcome.success &= file_result.success;
       outcome.changed |= file_result.changed;
@@ -1335,6 +1345,16 @@ private:
       outcome.success = false;
       return outcome;
     }
+    if(pm_ && pm_->transfer_debug_enabled()) {
+      std::cout << "[swarm] remote providers for " << primary.hash.substr(0, 8) << ": ";
+      bool first = true;
+      for(const auto& provider : remote_providers) {
+        if(!first) std::cout << ", ";
+        first = false;
+        std::cout << provider.peer_id;
+      }
+      std::cout << "\n";
+    }
 
     auto staging_path = download_root() / clean_relative;
     auto final_path = share_root() / clean_relative;
@@ -1452,8 +1472,8 @@ private:
       swarm_config.chunk_buffers = swarm_chunk_buffers_;
       swarm_config.progress_interval = swarm_progress_interval_;
       swarm_config.enable_meter = enable_meter && !quiet_attempt;
-      auto peer_current = std::make_shared<std::atomic<std::size_t>>(0);
       auto peer_total = std::make_shared<std::atomic<std::size_t>>(0);
+      auto active_peers = std::make_shared<std::atomic<std::size_t>>(0);
       auto seed_peer_counts = [&](const std::vector<PeerManager::RemoteListingItem>& items){
         std::unordered_set<std::string> unique;
         for(const auto& item : items) {
@@ -1461,11 +1481,10 @@ private:
           unique.insert(item.peer_id);
         }
         auto count = unique.size();
-        peer_current->store(count);
         peer_total->store(count);
       };
       seed_peer_counts(provider_set);
-      auto refresh_provider = make_swarm_refresh_provider(primary.hash, allowed_swarm_peers, peer_current, peer_total);
+      auto refresh_provider = make_swarm_refresh_provider(primary.hash, allowed_swarm_peers, peer_total);
       swarm_config.enable_dynamic_providers = static_cast<bool>(refresh_provider);
       swarm_config.provider_refresh_interval = swarm_provider_refresh_interval_;
       auto fetcher = [&](const std::string& peer_id,
@@ -1481,12 +1500,15 @@ private:
                              uint64_t downloaded,
                              bool /*force*/){
           auto meter = format_transfer_meter(states, downloaded, file_size, chunk_size);
-          std::size_t peers_now = peer_current ? peer_current->load() : provider_set.size();
-          std::size_t peers_total = peer_total ? peer_total->load() : peers_now;
-          if(peers_total == 0) peers_total = peers_now;
+          std::size_t peers_total = peer_total ? peer_total->load() : provider_set.size();
+          if(peers_total == 0) {
+            peers_total = provider_set.empty() ? 0 : provider_set.size();
+          }
+          std::size_t peers_active = active_peers ? active_peers->load() : 0;
+          if(peers_active > peers_total) peers_total = peers_active;
           std::ostringstream line;
           line << "\rSyncing " << primary.hash.substr(0, 8) << "... " << meter
-               << " P[" << peers_now << "/" << peers_total << "]";
+               << " P[" << peers_active << "/" << peers_total << "]";
           auto rendered = line.str();
           std::cout << rendered;
           if(rendered.size() < meter_line_width) {
@@ -1497,6 +1519,7 @@ private:
           std::cout.flush();
         };
       }
+      SwarmPeerStatsMap peer_stats;
       std::string swarm_failure;
       bool downloaded = run_swarm_download(primary.hash,
                                            file_size,
@@ -1507,7 +1530,9 @@ private:
                                            writer,
                                            meter_callback,
                                            swarm_failure,
-                                           refresh_provider);
+                                           refresh_provider,
+                                           &peer_stats,
+                                           active_peers);
       out.close();
       if(!downloaded) {
         if(!quiet_attempt && !swarm_failure.empty()) {
@@ -1564,9 +1589,14 @@ private:
       pm_->register_local_share(primary.hash, registered_path, final_path, file_size);
       auto elapsed = std::chrono::steady_clock::now() - download_start;
       auto elapsed_label = format_duration_compact(elapsed);
+      auto stats_summary = format_peer_stats_summary(peer_stats);
+      std::string stats_suffix;
+      if(!stats_summary.empty()) {
+        stats_suffix = " [" + stats_summary + "]";
+      }
       if(!quiet_attempt) {
         std::cout << "Synced " << clean_relative << " (" << format_size(file_size)
-                  << ") in " << elapsed_label << "\n";
+                  << ") in " << elapsed_label << stats_suffix << "\n";
       }
       outcome.changed = true;
       return DownloadAttemptResult::Success;
@@ -2609,12 +2639,29 @@ private:
     return oss.str();
   }
 
+  static std::string format_peer_stats_summary(const SwarmPeerStatsMap& stats) {
+    if(stats.empty()) return "";
+    std::vector<std::pair<std::string, SwarmPeerStats>> entries(stats.begin(), stats.end());
+    std::sort(entries.begin(), entries.end(),
+      [](const auto& a, const auto& b){
+        if(a.second.bytes == b.second.bytes) return a.first < b.first;
+        return a.second.bytes > b.second.bytes;
+      });
+    std::ostringstream oss;
+    bool first = true;
+    for(const auto& entry : entries) {
+      if(!first) oss << ", ";
+      first = false;
+      oss << entry.first << "=" << format_size(entry.second.bytes);
+    }
+    return oss.str();
+  }
+
   SwarmPeerProvider make_swarm_refresh_provider(const std::string& hash,
                                                 const std::unordered_set<std::string>& allowed_peers,
-                                                const std::shared_ptr<std::atomic<std::size_t>>& current_peer_count = nullptr,
-                                                const std::shared_ptr<std::atomic<std::size_t>>& max_peer_count = nullptr) {
+                                                const std::shared_ptr<std::atomic<std::size_t>>& available_peer_count = nullptr) {
     if(hash.empty()) return {};
-    return [this, hash, allowed_peers, current_peer_count, max_peer_count](){
+    return [this, hash, allowed_peers, available_peer_count](){
       std::vector<std::string> peers;
       auto listings = blocking_list_hash(hash);
       std::unordered_set<std::string> seen;
@@ -2626,14 +2673,8 @@ private:
           peers.push_back(item.peer_id);
         }
       }
-      if(current_peer_count) {
-        current_peer_count->store(peers.size());
-      }
-      if(max_peer_count) {
-        auto prev = max_peer_count->load();
-        while(peers.size() > prev && !max_peer_count->compare_exchange_weak(prev, peers.size())) {
-          // retry until stored
-        }
+      if(available_peer_count) {
+        available_peer_count->store(peers.size());
       }
       return peers;
     };
@@ -4198,8 +4239,8 @@ private:
     swarm_config.chunk_buffers = swarm_chunk_buffers_;
     swarm_config.progress_interval = swarm_progress_interval_;
     swarm_config.enable_meter = enable_meter;
-    auto peer_current = std::make_shared<std::atomic<std::size_t>>(0);
     auto peer_total = std::make_shared<std::atomic<std::size_t>>(0);
+    auto active_peers = std::make_shared<std::atomic<std::size_t>>(0);
     auto seed_peer_counts = [&](const std::vector<PeerManager::RemoteListingItem>& items){
       std::unordered_set<std::string> unique;
       for(const auto& item : items) {
@@ -4207,11 +4248,10 @@ private:
         unique.insert(item.peer_id);
       }
       auto count = unique.size();
-      peer_current->store(count);
       peer_total->store(count);
     };
     seed_peer_counts(remote_providers);
-    auto refresh_provider = make_swarm_refresh_provider(primary.hash, {}, peer_current, peer_total);
+    auto refresh_provider = make_swarm_refresh_provider(primary.hash, {}, peer_total);
     swarm_config.enable_dynamic_providers = static_cast<bool>(refresh_provider);
     swarm_config.provider_refresh_interval = swarm_provider_refresh_interval_;
     auto fetcher = [&](const std::string& peer_id,
@@ -4227,12 +4267,13 @@ private:
                            uint64_t downloaded,
                            bool /*force*/){
         auto meter = format_transfer_meter(states, downloaded, file_size, chunk_size);
-        std::size_t peers_now = peer_current ? peer_current->load() : remote_providers.size();
-        std::size_t peers_total = peer_total ? peer_total->load() : peers_now;
-        if(peers_total == 0) peers_total = peers_now;
+        std::size_t peers_total = peer_total ? peer_total->load() : remote_providers.size();
+        if(peers_total == 0) peers_total = remote_providers.empty() ? 0 : remote_providers.size();
+        std::size_t peers_active = active_peers ? active_peers->load() : 0;
+        if(peers_active > peers_total) peers_total = peers_active;
         std::ostringstream line;
         line << "\rStaging " << primary.hash.substr(0, 8) << "... " << meter
-             << " P[" << peers_now << "/" << peers_total << "]";
+             << " P[" << peers_active << "/" << peers_total << "]";
         auto rendered = line.str();
         std::cout << rendered;
         if(rendered.size() < meter_line_width) {
@@ -4253,7 +4294,9 @@ private:
                                          writer,
                                          meter_callback,
                                          failure_reason,
-                                         refresh_provider);
+                                         refresh_provider,
+                                         nullptr,
+                                         active_peers);
     out.close();
     if(!downloaded) {
       if(!quiet && !failure_reason.empty()) {
@@ -4513,8 +4556,8 @@ private:
   }
 
   static std::string format_size(uint64_t bytes) {
-    if(bytes <= 999999) {
-      return std::to_string(bytes);
+    if(bytes < 1024) {
+      return std::to_string(bytes) + "b";
     }
 
     static const char* suffixes[] = {"B", "K", "M", "G", "T", "P"};

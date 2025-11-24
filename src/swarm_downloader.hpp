@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
+#include <memory>
 
 #include "peer_manager.hpp"
 
@@ -18,6 +20,13 @@ struct SwarmConfig {
   bool enable_dynamic_providers = false;
   std::chrono::milliseconds provider_refresh_interval{1500};
 };
+
+struct SwarmPeerStats {
+  uint64_t chunks = 0;
+  uint64_t bytes = 0;
+};
+
+using SwarmPeerStatsMap = std::unordered_map<std::string, SwarmPeerStats>;
 
 using SwarmChunkFetcher = std::function<PeerManager::ChunkResponse(
   const std::string& peer_id,
@@ -42,4 +51,6 @@ bool run_swarm_download(const std::string& hash,
                         const SwarmChunkWriter& write_chunk,
                         const SwarmMeterCallback& meter_callback,
                         std::string& failure_reason,
-                        const SwarmPeerProvider& refresh_providers = {});
+                        const SwarmPeerProvider& refresh_providers = {},
+                        SwarmPeerStatsMap* peer_stats = nullptr,
+                        const std::shared_ptr<std::atomic<std::size_t>>& active_peer_count = nullptr);
