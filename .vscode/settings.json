@@ -59,6 +59,10 @@
     "forward_list": "cpp",
     "fstream": "cpp",
     "filesystem": "cpp",
-    "functional": "cpp"
+    "functional": "cpp",
+    "unordered_set": "cpp",
+    "condition_variable": "cpp",
+    "future": "cpp",
+    "map": "cpp"
   }
 }
