@@ -49,9 +49,11 @@ public:
   explicit MeshCLI(std::shared_ptr<PeerManager> pm,
                    std::shared_ptr<SettingsManager> settings,
                    std::chrono::seconds default_watch_interval = std::chrono::seconds(60),
-                   bool audio_notifications = false)
+                   bool audio_notifications = false,
+                   std::filesystem::path workspace_root = std::filesystem::current_path())
     : pm_(std::move(pm)), settings_(std::move(settings)), running_(true),
-      default_watch_interval_(default_watch_interval), audio_notifications_(audio_notifications) {
+      default_watch_interval_(default_watch_interval), audio_notifications_(audio_notifications),
+      workspace_root_(std::move(workspace_root)) {
     ensure_directories();
     load_dir_guid_registry();
     apply_dir_guid_registry();
@@ -91,6 +93,10 @@ public:
     if(cli_thread_.joinable()) cli_thread_.join();
   }
 
+  void execute_command(const std::string& line) {
+    dispatch_command(line);
+  }
+
 private:
   struct ListCommand {
     enum class Type {
@@ -122,6 +128,7 @@ private:
   std::chrono::milliseconds swarm_progress_interval_{200};
   std::chrono::milliseconds swarm_provider_refresh_interval_{2000};
   std::chrono::milliseconds chunk_timeout_{10000};
+  std::filesystem::path workspace_root_;
 
   struct WatchEntry {
     std::string id;
@@ -239,112 +246,120 @@ private:
       auto input = read_command_line("> ");
       if(!input) break;
       if(input->empty()) continue;
+      dispatch_command(*input);
+    }
+  }
 
-      std::istringstream iss(*input);
-      std::string cmd;
-      iss >> cmd;
+  void dispatch_command(const std::string& line) {
+    std::string trimmed = line;
+    trim(trimmed);
+    if(trimmed.empty()) return;
 
-      if(cmd == "send") {
-        std::string msg;
-        std::getline(iss, msg);
-        if(!msg.empty() && msg[0] == ' ') msg.erase(0, 1);
-        send_chat(msg);
-      } else if(cmd == "peers") {
-        list_peers();
-      } else if(cmd == "list" || cmd == "ls" || cmd == "l") {
-        std::string arg;
-        std::getline(iss, arg);
-        trim(arg);
-        handle_list(arg);
-      } else if(cmd == "la") {
-        std::string extras;
-        std::getline(iss, extras);
-        trim(extras);
-        if(!extras.empty()) {
-          handle_list("all " + extras);
-        } else {
-          handle_list("all");
-        }
-      } else if(cmd == "share") {
-        std::string path;
-        std::getline(iss, path);
-        trim(path);
-        share_command(path);
-      } else if(cmd == "sync") {
-        std::string target;
-        std::getline(iss, target);
-        trim(target);
-        sync_command(target);
-      } else if(cmd == "watch") {
-        std::string args;
-        std::getline(iss, args);
-        trim(args);
-        handle_watch_command(args);
-      } else if(cmd == "unwatch") {
-        std::string args;
-        std::getline(iss, args);
-        trim(args);
-        std::string forwarded = "remove";
-        if(!args.empty()) {
-          forwarded += " ";
-          forwarded += args;
-        }
-        handle_watch_command(forwarded);
-      } else if(cmd == "bell") {
-        std::cout << '\a';
-        std::cout.flush();
-      } else if(cmd == "settings" || cmd == "s") {
-        std::string args;
-        std::getline(iss, args);
-        trim(args);
-        if(args.empty()) args = "list";
-        handle_settings_command(args);
-      } else if(cmd == "set") {
-        std::string args;
-        std::getline(iss, args);
-        trim(args);
-        if(args.empty()) {
-          handle_settings_command("list");
-        } else {
-          handle_settings_command("set " + args);
-        }
-      } else if(cmd == "get") {
-        std::string args;
-        std::getline(iss, args);
-        trim(args);
-        handle_settings_command(args.empty() ? "get" : "get " + args);
-      } else if(cmd == "save") {
-        handle_settings_command("save");
-      } else if(cmd == "load") {
-        handle_settings_command("load");
-      } else if(cmd == "ignore") {
-        std::string args;
-        std::getline(iss, args);
-        trim(args);
-        handle_ignore_command(args);
-      } else if(cmd == "guid") {
-        std::string args;
-        std::getline(iss, args);
-        trim(args);
-        handle_guid_command(args);
-      } else if(cmd == "conflict") {
-        std::string args;
-        std::getline(iss, args);
-        trim(args);
-        handle_conflict_command(args);
-      } else if(cmd == "help" || cmd == "h" || cmd == "?") {
-        print_help();
-      } else if(cmd == "quit") {
-        std::cout << "Quitting...\n";
-        exit(-1);
-      } else if(cmd == "dirs") {
-        print_dirs();
-      } else if(cmd == "pwd" || cmd == "cwd") {
-        print_current_directory();
+    std::istringstream iss(trimmed);
+    std::string cmd;
+    iss >> cmd;
+    if(cmd.empty()) return;
+
+    if(cmd == "send") {
+      std::string msg;
+      std::getline(iss, msg);
+      if(!msg.empty() && msg[0] == ' ') msg.erase(0, 1);
+      send_chat(msg);
+    } else if(cmd == "peers") {
+      list_peers();
+    } else if(cmd == "list" || cmd == "ls" || cmd == "l") {
+      std::string arg;
+      std::getline(iss, arg);
+      trim(arg);
+      handle_list(arg);
+    } else if(cmd == "la") {
+      std::string extras;
+      std::getline(iss, extras);
+      trim(extras);
+      if(!extras.empty()) {
+        handle_list("all " + extras);
       } else {
-        print_help();
-        std::cout << "Unknown command: " << cmd << "\n";
+        handle_list("all");
       }
+    } else if(cmd == "share") {
+      std::string path;
+      std::getline(iss, path);
+      trim(path);
+      share_command(path);
+    } else if(cmd == "sync") {
+      std::string target;
+      std::getline(iss, target);
+      trim(target);
+      sync_command(target);
+    } else if(cmd == "watch") {
+      std::string args;
+      std::getline(iss, args);
+      trim(args);
+      handle_watch_command(args);
+    } else if(cmd == "unwatch") {
+      std::string args;
+      std::getline(iss, args);
+      trim(args);
+      std::string forwarded = "remove";
+      if(!args.empty()) {
+        forwarded += " ";
+        forwarded += args;
+      }
+      handle_watch_command(forwarded);
+    } else if(cmd == "bell") {
+      std::cout << '\a';
+      std::cout.flush();
+    } else if(cmd == "settings" || cmd == "s") {
+      std::string args;
+      std::getline(iss, args);
+      trim(args);
+      if(args.empty()) args = "list";
+      handle_settings_command(args);
+    } else if(cmd == "set") {
+      std::string args;
+      std::getline(iss, args);
+      trim(args);
+      if(args.empty()) {
+        handle_settings_command("list");
+      } else {
+        handle_settings_command("set " + args);
+      }
+    } else if(cmd == "get") {
+      std::string args;
+      std::getline(iss, args);
+      trim(args);
+      handle_settings_command(args.empty() ? "get" : "get " + args);
+    } else if(cmd == "save") {
+      handle_settings_command("save");
+    } else if(cmd == "load") {
+      handle_settings_command("load");
+    } else if(cmd == "ignore") {
+      std::string args;
+      std::getline(iss, args);
+      trim(args);
+      handle_ignore_command(args);
+    } else if(cmd == "guid") {
+      std::string args;
+      std::getline(iss, args);
+      trim(args);
+      handle_guid_command(args);
+    } else if(cmd == "conflict") {
+      std::string args;
+      std::getline(iss, args);
+      trim(args);
+      handle_conflict_command(args);
+    } else if(cmd == "help" || cmd == "h" || cmd == "?") {
+      print_help();
+    } else if(cmd == "quit") {
+      std::cout << "Quitting...\n";
+      exit(-1);
+    } else if(cmd == "dirs") {
+      print_dirs();
+    } else if(cmd == "pwd" || cmd == "cwd") {
+      print_current_directory();
+    } else {
+      print_help();
+      std::cout << "Unknown command: " << cmd << "\n";
     }
   }
 
@@ -4480,7 +4495,7 @@ private:
   }
 
   std::filesystem::path share_root() const {
-    return std::filesystem::current_path() / "share";
+    return workspace_root_ / "share";
   }
 
   std::filesystem::path download_root() const {
@@ -4488,7 +4503,7 @@ private:
   }
 
   std::filesystem::path config_root() const {
-    return std::filesystem::current_path() / ".config";
+    return workspace_root_ / ".config";
   }
 
   std::filesystem::path legacy_config_root() const {
@@ -4528,7 +4543,7 @@ private:
       }
     }
 
-    auto legacy_watches_root = std::filesystem::current_path() / "watches.json";
+    auto legacy_watches_root = workspace_root_ / "watches.json";
     migrate_file(legacy_watches_root, target / "watches.json");
   }
 
@@ -4963,13 +4978,13 @@ private:
   }
 
   void print_dirs() {
-    std::cout << "Current directory : " << std::filesystem::current_path() << "\n";
+    std::cout << "Current directory : " << workspace_root_ << "\n";
     std::cout << "Share directory   : " << share_root() << "\n";
     std::cout << "Staging directory : " << download_root() << "\n";
   }
 
   void print_current_directory() {
-    std::cout << std::filesystem::current_path() << "\n";
+    std::cout << workspace_root_ << "\n";
   }
 
   void load_dir_guid_registry() {

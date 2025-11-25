@@ -66,14 +66,19 @@ PeerManager::PeerManager(asio::io_context& io,
                          std::string display_name,
                          std::string local_addr,
                          std::string external_addr,
-                         size_t max_peers)
+                         size_t max_peers,
+                         std::shared_ptr<EngineLogger> logger)
     : io_(io),
       local_peer_id_(std::move(local_peer_id)),
-      display_name_(std::move(display_name)),
       local_addr_(std::move(local_addr)),
+      max_peers_(max_peers),
+      display_name_(std::move(display_name)),
       external_addr_(std::move(external_addr)),
-      max_peers_(max_peers)
+      logger_(std::move(logger))
 {
+  if(!logger_) {
+    logger_ = std::make_shared<EngineLogger>(local_peer_id_);
+  }
   // Add self to peers list
   PeerInfo self;
   self.peer_id = local_peer_id_;
@@ -104,16 +109,16 @@ void PeerManager::add_peer_discovered(const std::string& peer_id,
     pi.external_addr = external_addr;
     pi.state = PeerInfo::State::Disconnected;
     peers_[peer_id] = pi;
-    log_info("Discovered new peer {} ({}) @ local:{} external:{}", peer_id, display_name, local_addr, external_addr);
+    logger_->info("Discovered new peer {} ({}) @ local:{} external:{}", peer_id, display_name, local_addr, external_addr);
   } else {
     // update addresses if changed
     if(it->second.local_addr != local_addr){
       it->second.local_addr = local_addr;
-      log_info("Updated peer {} local_addr -> {}", peer_id, local_addr);
+      logger_->info("Updated peer {} local_addr -> {}", peer_id, local_addr);
     }
     if(it->second.external_addr != external_addr){
       it->second.external_addr = external_addr;
-      log_info("Updated peer {} external_addr -> {}", peer_id, external_addr);
+      logger_->info("Updated peer {} external_addr -> {}", peer_id, external_addr);
     }
   }
 }
@@ -128,7 +133,7 @@ void PeerManager::on_connected(const std::string& peer_id, std::shared_ptr<Conne
             return; // already processed this connection
         }
 
-        log_info("PeerManager: connected {}", peer_id);
+        logger_->info("PeerManager: connected {}", peer_id);
         connections_[peer_id] = conn;
 
         if(peers_.count(peer_id)){
@@ -154,7 +159,7 @@ void PeerManager::on_connected(const std::string& peer_id, std::shared_ptr<Conne
 
 void PeerManager::on_disconnected(const std::string& peer_id){
   std::lock_guard lg(m_);
-  log_info("PeerManager: disconnected {}", peer_id);
+  logger_->info("PeerManager: disconnected {}", peer_id);
   connections_.erase(peer_id);
   if(peers_.count(peer_id)){
     peers_[peer_id].state = PeerInfo::State::Disconnected;
@@ -208,7 +213,7 @@ void PeerManager::dispatch_chat_message(const std::string& from_peer,
   if(cb) {
     cb(from_peer, text);
   } else {
-    print_out("[{}] {}", from_peer, text);
+    logger_->print("[{}] {}", from_peer, text);
   }
 }
 
@@ -422,6 +427,16 @@ void PeerManager::set_transfer_debug(bool enabled){
 
 bool PeerManager::transfer_debug_enabled() const{
   return transfer_debug_.load(std::memory_order_relaxed);
+}
+
+std::size_t PeerManager::known_peer_count() const {
+  std::lock_guard lg(m_);
+  return peers_.size();
+}
+
+std::size_t PeerManager::connected_peer_count() const {
+  std::lock_guard lg(m_);
+  return connections_.size();
 }
 
 std::string PeerManager::generate_directory_guid(){
@@ -732,9 +747,9 @@ void PeerManager::handle_list_request(const std::string& peer_id,
     try {
       refresh_cb();
     } catch(const std::exception& e) {
-      log_warn("Listing refresh callback threw: {}", e.what());
+      logger_->warn("Listing refresh callback threw: {}", e.what());
     } catch(...) {
-      log_warn("Listing refresh callback threw unknown exception");
+      logger_->warn("Listing refresh callback threw unknown exception");
     }
   }
 
@@ -827,7 +842,7 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
     } else if(current_peer_id == peer_id){
       // already bound to this peer; nothing additional needed
     } else if(ttl >= kPeerAnnounceDefaultTTL){
-      log_warn("Connection reported different peer_id {} (previously {})", peer_id, current_peer_id);
+      logger_->warn("Connection reported different peer_id {} (previously {})", peer_id, current_peer_id);
       conn->set_peer_id(peer_id);
       current_peer_id = peer_id;
       on_connected(peer_id, conn);
@@ -858,7 +873,7 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
     std::string hash = j.value("hash", "");
     std::string fname = j.value("filename", "");
     std::string origin = current_peer_id.empty() ? j.value("peer_id", "unknown") : current_peer_id;
-    print_out("[{}] shared file {} -> {}", origin, fname, hash);
+    logger_->print("[{}] shared file {} -> {}", origin, fname, hash);
   } else if(type == "list_request"){
     std::string request_id = j.value("request_id", "");
     std::string path = j.value("path", "");
@@ -898,21 +913,21 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
     std::string peer_label = requester.empty() ? "<unknown>" : requester;
     if(request_id.empty() || hash.empty()){
       if(transfer_debug){
-        log_info("[transfer] chunk request from {} ignored due to missing metadata (request_id='{}', hash='{}')",
+        logger_->info("[transfer] chunk request from {} ignored due to missing metadata (request_id='{}', hash='{}')",
                  peer_label, request_id, hash);
       }
       return;
     }
 
     if(transfer_debug){
-      log_info("[transfer] <= chunk request {} hash {} offset {} length {} from {}",
+      logger_->info("[transfer] <= chunk request {} hash {} offset {} length {} from {}",
                request_id, hash, offset, length, peer_label);
     }
 
     SharedFileEntry entry;
     if(!find_local_file_by_hash(hash, entry)){
       if(transfer_debug){
-        log_info("[transfer] chunk request {} for hash {} from {} failed: unknown hash",
+        logger_->info("[transfer] chunk request {} for hash {} from {} failed: unknown hash",
                  request_id, hash, peer_label);
       }
       nlohmann::json err;
@@ -926,7 +941,7 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
 
     if(offset >= entry.size){
       if(transfer_debug){
-        log_info("[transfer] chunk request {} for hash {} from {} failed: offset {} >= size {}",
+        logger_->info("[transfer] chunk request {} for hash {} from {} failed: offset {} >= size {}",
                  request_id, hash, peer_label, offset, entry.size);
       }
       nlohmann::json err;
@@ -945,7 +960,7 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
     std::ifstream file(entry.full_path, std::ios::binary);
     if(!file){
       if(transfer_debug){
-        log_info("[transfer] chunk request {} for hash {} from {} failed: cannot open {}",
+        logger_->info("[transfer] chunk request {} for hash {} from {} failed: cannot open {}",
                  request_id, hash, peer_label, entry.full_path.string());
       }
       nlohmann::json err;
@@ -963,7 +978,7 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
     std::streamsize read_bytes = file.gcount();
     if(read_bytes <= 0){
       if(transfer_debug){
-        log_info("[transfer] chunk request {} for hash {} from {} failed: read {} bytes",
+        logger_->info("[transfer] chunk request {} for hash {} from {} failed: read {} bytes",
                  request_id, hash, peer_label, read_bytes);
       }
       nlohmann::json err;
@@ -988,7 +1003,7 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
     resp["chunk_sha"] = chunk_sha;
     resp["data"] = encoded;
     if(transfer_debug){
-      log_info("[transfer] => sending {} bytes for hash {} offset {} to {} (request {})",
+      logger_->info("[transfer] => sending {} bytes for hash {} offset {} to {} (request {})",
                buffer.size(), hash, offset, peer_label, request_id);
     }
     send(resp);
@@ -1015,10 +1030,10 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
     }
     if(transfer_debug){
       if(response.success){
-        log_info("[transfer] <= received {} bytes for hash {} offset {} from {} (request {})",
+        logger_->info("[transfer] <= received {} bytes for hash {} offset {} from {} (request {})",
                  response.data.size(), hash, offset, peer_label, request_id);
       } else {
-        log_info("[transfer] chunk response {} for hash {} offset {} from {} failed: {}",
+        logger_->info("[transfer] chunk response {} for hash {} offset {} from {} failed: {}",
                  request_id, hash, offset, peer_label, response.error);
       }
     }
@@ -1043,7 +1058,7 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
         resp["data"] = b64;
         send(resp);
         std::string origin = current_peer_id.empty() ? j.value("peer_id", "unknown") : current_peer_id;
-        print_out("[{}] sending file {}", origin, path.string());
+        logger_->print("[{}] sending file {}", origin, path.string());
       } else {
         nlohmann::json err;
         err["type"] = "file_error";
@@ -1065,9 +1080,9 @@ void PeerManager::handle_message(std::shared_ptr<Connection> conn, const nlohman
     std::ofstream out(outpath, std::ios::binary);
     out.write(bytes.data(), bytes.size());
     std::string origin = current_peer_id.empty() ? j.value("peer_id", "unknown") : current_peer_id;
-    print_out("[{}] received file {} -> {}", origin, fname, outpath.string());
+    logger_->print("[{}] received file {} -> {}", origin, fname, outpath.string());
   } else {
-    log_info("Unknown message type: {}", type);
+    logger_->info("Unknown message type: {}", type);
   }
 }
 
@@ -1095,7 +1110,7 @@ std::optional<std::string> PeerManager::request_file_chunk(const std::string& pe
   req["length"] = length;
   const bool transfer_debug = transfer_debug_.load(std::memory_order_relaxed);
   if(transfer_debug){
-    log_info("[transfer] => requesting hash {} offset {} length {} from {} (request {})",
+    logger_->info("[transfer] => requesting hash {} offset {} length {} from {} (request {})",
              hash, offset, length, peer_id, request_id);
   }
   if(send_json_to_peer(peer_id, req)){
@@ -1103,7 +1118,7 @@ std::optional<std::string> PeerManager::request_file_chunk(const std::string& pe
   }
 
   if(transfer_debug){
-    log_info("[transfer] chunk request {} to {} failed to send", request_id, peer_id);
+    logger_->info("[transfer] chunk request {} to {} failed to send", request_id, peer_id);
   }
   cancel_chunk_request(request_id);
   return std::nullopt;

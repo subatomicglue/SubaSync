@@ -49,7 +49,7 @@ void Connection::do_read(){
     asio::async_read_until(socket_, read_buf_, "\n",
         [this, self](std::error_code ec, std::size_t bytes_transferred){
             if(ec){
-                log_info("Connection read error: {}", ec.message());
+                pm_->logger()->info("Connection read error: {}", ec.message());
                 close();
                 return;
             }
@@ -68,7 +68,7 @@ void Connection::handle_line(std::string line){
         auto j = json::parse(line);
         pm_->handle_message(shared_from_this(), j);
     } catch(const std::exception& ex){
-        log_warn("Failed to parse JSON: {}  raw: {}", ex.what(), line);
+        pm_->logger()->warn("Failed to parse JSON: {}  raw: {}", ex.what(), line);
     }
 }
 
@@ -92,7 +92,7 @@ void Connection::do_write(){
     asio::async_write(socket_, asio::buffer(write_queue_.front()),
         [this, self](std::error_code ec, std::size_t){
         if(ec){
-            log_info("Connection write error: {}", ec.message());
+            pm_->logger()->info("Connection write error: {}", ec.message());
             close();
             return;
         }
@@ -119,17 +119,17 @@ void Connection::connect_outgoing(asio::io_context& io,
     resolver->async_resolve(host, std::to_string(port),
         [resolver, &io, pm, host, port](std::error_code ec, asio::ip::tcp::resolver::results_type results){
             if(ec){
-                log_info("Resolve failed for {}:{}  {}", host, port, ec.message());
+                pm->logger()->info("Resolve failed for {}:{}  {}", host, port, ec.message());
                 return;
             }
             auto sock = std::make_shared<asio::ip::tcp::socket>(io);
             asio::async_connect(*sock, results,
                 [sock, pm](std::error_code ec, asio::ip::tcp::endpoint ep){
                     if(ec){
-                        log_info("Connect failed: {}", ec.message());
+                        pm->logger()->info("Connect failed: {}", ec.message());
                         return;
                     }
-                    log_info("Connected outgoing to {}:{}", ep.address().to_string(), ep.port());
+                    pm->logger()->info("Connected outgoing to {}:{}", ep.address().to_string(), ep.port());
                     auto conn = Connection::create_incoming(pm->io(), std::move(*sock), pm);
                     // We created a Connection with the connected socket and reused the create_incoming path
                     // It will exchange announces and then call pm->on_connected when peer_id is seen.

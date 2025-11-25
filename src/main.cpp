@@ -3,11 +3,13 @@
 #include <cpptrace/cpptrace.hpp>
 #include <sstream>
 #include <chrono>
+#include <filesystem>
 
 #include "connection.hpp"
 #include "peer_manager.hpp"
 #include "protocol.hpp"
 #include "MeshCLI.hpp"
+#include "command_line_parser.hpp"
 #include "settings_manager.hpp"
 #include "log.hpp"
 
@@ -24,7 +26,7 @@ std::string random_peer_id(){
     return "peer-" + std::to_string(s.fetch_add(1));
 }
 
-std::string get_external_ip(asio::io_context& io) {
+std::string get_external_ip(asio::io_context& io, EngineLogger& logger) {
     using asio::ip::tcp;
     try {
         tcp::resolver resolver(io);
@@ -58,7 +60,7 @@ std::string get_external_ip(asio::io_context& io) {
 
         return body;
     } catch (const std::exception& e) {
-        log_warn("get_external_ip() failed: {}", e.what());
+        logger.warn("get_external_ip() failed: {}", e.what());
         return "";
     }
 }
@@ -76,16 +78,31 @@ std::string get_unique_display_name() {
 int main(int argc, char** argv){
   try {
     auto settings = std::make_shared<SettingsManager>();
-    settings->init(argc, argv);
+    settings->set_settings_path(std::filesystem::current_path() / ".config" / "settings.json");
+    settings->load();
 
-    init(settings->get<bool>("verbose"));
-    if(settings->get<bool>("verbose")) {
-      log_debug("Verbose logging enabled");
+    CommandLineParser parser((argc > 0 && argv && argv[0]) ? argv[0] : "sync");
+    parser.parse(argc, argv, *settings);
+    if(settings->help_requested()) {
+      parser.usage();
+      return 0;
+    }
+
+    bool verbose = settings->get<bool>("verbose");
+    std::string local_peer_id = settings->get<std::string>("peer_id");
+    if(local_peer_id.empty()) {
+      local_peer_id = random_peer_id();
+    }
+
+    init(verbose);
+    auto logger = std::make_shared<EngineLogger>(local_peer_id);
+    if(verbose) {
+      logger->debug("Verbose logging enabled");
     }
 
     if(settings->save_requested()) {
       if(!settings->save()) {
-        log_error("Unable to persist settings to {}", settings->settings_path().string());
+        logger->error("Unable to persist settings to {}", settings->settings_path().string());
       }
     }
 
@@ -94,35 +111,29 @@ int main(int argc, char** argv){
     // Setup signal handling
     asio::signal_set signals(io, SIGINT, SIGTERM);
     signals.async_wait([&](const std::error_code&, int){
-        log_info("Signal received, stopping io_context");
+        logger->info("Signal received, stopping io_context");
         io.stop();
     });
 
     std::string external_ip;
     try {
-      external_ip = get_external_ip(io);
-      print_out("External IP: {}", external_ip);
+      external_ip = get_external_ip(io, *logger);
+      logger->print("External IP: {}", external_ip);
     } catch(...) {
-      log_warn("Unable to detect external IP, will only advertise local_addr");
+      logger->warn("Unable to detect external IP, will only advertise local_addr");
     }
 
     std::string display_name = get_unique_display_name();
 
     int listen_port_value = settings->get<int>("listen_port");
     if(listen_port_value <= 0 || listen_port_value > 65535) {
-      log_error("Invalid listen_port '{}'", listen_port_value);
-      settings->usage();
+      logger->error("Invalid listen_port '{}'", listen_port_value);
       return 1;
     }
     unsigned short listen_port = static_cast<unsigned short>(listen_port_value);
 
     std::string listen_ip = settings->get<std::string>("listen_ip");
     std::string bootstrap = settings->get<std::string>("bootstrap_peer");
-
-    std::string local_peer_id = settings->get<std::string>("peer_id");
-    if(local_peer_id.empty()) {
-      local_peer_id = random_peer_id();
-    }
 
     int external_port_value = settings->get<int>("external_port");
     unsigned short external_port = listen_port;
@@ -133,24 +144,27 @@ int main(int argc, char** argv){
     std::string external_addr = external_ip.empty() ? "" : external_ip + ":" + std::to_string(external_port);
     std::string local_addr = make_local_addr(listen_ip, listen_port);
 
-    auto pm = std::make_shared<PeerManager>(io, local_peer_id, display_name,
-                                      local_addr,
-                                      external_addr,
-                                      6);
+    auto pm = std::make_shared<PeerManager>(io,
+                                            local_peer_id,
+                                            display_name,
+                                            local_addr,
+                                            external_addr,
+                                            6,
+                                            logger);
     pm->set_transfer_debug(settings->get<bool>("transfer_debug"));
 
     // Start acceptor
     tcp::acceptor acceptor(io, tcp::endpoint(asio::ip::make_address(listen_ip), listen_port));
-    log_info("Display Name: {}", display_name);
-    log_info("Listening {}:{} as {}", listen_ip, listen_port, local_peer_id);
+    logger->info("Display Name: {}", display_name);
+    logger->info("Listening {}:{} as {}", listen_ip, listen_port, local_peer_id);
 
     std::function<void()> do_accept;
     do_accept = [&]{
         acceptor.async_accept([&](std::error_code ec, tcp::socket sock){
             if(ec){
-                log_error("Accept error: {}", ec.message());
+                logger->error("Accept error: {}", ec.message());
             } else {
-                log_info("Accepted connection from {}", sock.remote_endpoint().address().to_string());
+                logger->info("Accepted connection from {}", sock.remote_endpoint().address().to_string());
                 auto conn = Connection::create_incoming(io, std::move(sock), pm);
                 // Connection will call pm->on_connected when it learns peer_id from announce
             }
@@ -168,13 +182,11 @@ int main(int argc, char** argv){
           unsigned short p = static_cast<unsigned short>(std::stoi(bootstrap.substr(pos + 1)));
           Connection::connect_outgoing(io, host, p, pm);
         } catch(const std::exception& e) {
-          log_error("Invalid bootstrap specification '{}': {}", bootstrap, e.what());
-          settings->usage();
+          logger->error("Invalid bootstrap specification '{}': {}", bootstrap, e.what());
           return 1;
         }
       } else {
-        log_error("Bootstrap peer must be in host:port format: '{}'", bootstrap);
-        settings->usage();
+        logger->error("Bootstrap peer must be in host:port format: '{}'", bootstrap);
         return 1;
       }
     }
@@ -198,7 +210,9 @@ int main(int argc, char** argv){
 
     return 0;
   } catch(std::exception& e) {
-    log_error("Exception: {}", e.what());
+    init(false);
+    auto logger = EngineLogger("sync-main");
+    logger.error("Exception: {}", e.what());
     cpptrace::generate_trace().print();
     return 1;
   }

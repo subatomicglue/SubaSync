@@ -35,21 +35,10 @@ inline const nlohmann::json SETTINGS_SPECIFICATION = nlohmann::json::array({
   {{"key","save"},                {"aliases", {"persist"}},        {"type","bool"},   {"default",false},     {"description","Persist current settings to disk"}, {"persistent", false}}
 });
 
-inline const nlohmann::json ARGV_SPECIFICATION = nlohmann::json::array({
-  {{"index",0},{"key","listen_port"}},
-  {{"index",1},{"key","listen_ip"}},
-  {{"index",2},{"key","bootstrap_peer"}},
-  {{"index",3},{"key","peer_id"}},
-  {{"index",4},{"key","external_port"}}
-});
-
 class SettingsManager {
 public:
   SettingsManager();
-
-  void init(int argc, char* argv[]);
-
-  void usage() const;
+  explicit SettingsManager(const nlohmann::json& specification);
 
   template<typename T>
   T get(const std::string& key) const;
@@ -57,10 +46,12 @@ public:
   bool has(const std::string& key) const;
 
   bool set_from_string(const std::string& key, const std::string& value, std::string& error);
-  bool set(const std::string& key, const nlohmann::json& value, std::string& error);
+  bool set_from_json(const std::string& key, const nlohmann::json& value, std::string& error);
 
   bool save() const;
   bool load();
+  bool save_to_file(const std::filesystem::path& path) const;
+  bool load_from_file(const std::filesystem::path& path);
 
   bool save_requested() const { return has("save") && get<bool>("save"); }
   bool help_requested() const { return has("help") && get<bool>("help"); }
@@ -68,8 +59,15 @@ public:
   std::vector<std::string> keys() const;
   std::string value_as_string(const std::string& key) const;
   std::optional<std::string> resolve_key(const std::string& token) const;
+  bool is_bool_setting(const std::string& key) const;
 
   std::filesystem::path settings_path() const;
+  void set_settings_path(const std::filesystem::path& path);
+
+  void set_json(const nlohmann::json& doc);
+  nlohmann::json get_json(bool persistent_only = true) const;
+  static std::string to_lower(std::string value);
+  static std::string trim_copy(std::string value);
 
 private:
   struct SettingSpec {
@@ -82,239 +80,72 @@ private:
     bool persistent = true;
   };
 
-  struct ArgvSpec {
-    std::size_t index = 0;
-    std::string key;
-  };
-
-  static const std::vector<SettingSpec>& setting_specs();
-  static const std::vector<ArgvSpec>& argv_specs();
+  static std::vector<SettingSpec> build_setting_specs(const nlohmann::json& specification);
+  const std::vector<SettingSpec>& setting_specs() const { return setting_specs_; }
 
   const SettingSpec* find_spec(const std::string& token) const;
 
   void apply_defaults();
   void merge_from_json(const nlohmann::json& doc);
-  void parse_args(int argc, char* argv[]);
 
   bool convert_and_store(const SettingSpec& spec, const nlohmann::json& value, std::string& error);
   nlohmann::json parse_string_value(const SettingSpec& spec, const std::string& value, std::string& error) const;
 
-  static std::string to_lower(std::string value);
-  static std::string trim_copy(std::string value);
   static bool is_bool_literal(const std::string& value);
   std::string default_to_string(const SettingSpec& spec) const;
 
   nlohmann::json settings_;
-  std::string processname_;
+  std::vector<SettingSpec> setting_specs_;
+  std::filesystem::path settings_path_override_;
 };
 
 // ---- implementation -------------------------------------------------------
 
-inline const std::vector<SettingsManager::SettingSpec>& SettingsManager::setting_specs() {
-  static const std::vector<SettingSpec> specs = []{
-    std::vector<SettingSpec> result;
-    for(const auto& entry : SETTINGS_SPECIFICATION) {
-      SettingSpec spec;
-      spec.key = entry.at("key").get<std::string>();
-      spec.normalized_key = SettingsManager::to_lower(spec.key);
-      if(entry.contains("aliases")) {
-        spec.aliases = entry.at("aliases").get<std::vector<std::string>>();
-        for(auto& alias : spec.aliases) {
-          alias = SettingsManager::to_lower(alias);
-        }
+inline std::vector<SettingsManager::SettingSpec> SettingsManager::build_setting_specs(const nlohmann::json& specification) {
+  std::vector<SettingSpec> result;
+  for(const auto& entry : specification) {
+    SettingSpec spec;
+    spec.key = entry.at("key").get<std::string>();
+    spec.normalized_key = SettingsManager::to_lower(spec.key);
+    if(entry.contains("aliases")) {
+      spec.aliases = entry.at("aliases").get<std::vector<std::string>>();
+      for(auto& alias : spec.aliases) {
+        alias = SettingsManager::to_lower(alias);
       }
-      spec.type = entry.at("type").get<std::string>();
-      spec.default_value = entry.at("default");
-      spec.description = entry.value("description", "");
-      spec.persistent = entry.value("persistent", true);
-      result.push_back(std::move(spec));
     }
-    return result;
-  }();
-  return specs;
+    spec.type = entry.at("type").get<std::string>();
+    spec.default_value = entry.at("default");
+    spec.description = entry.value("description", "");
+    spec.persistent = entry.value("persistent", true);
+    result.push_back(std::move(spec));
+  }
+  return result;
 }
 
-inline const std::vector<SettingsManager::ArgvSpec>& SettingsManager::argv_specs() {
-  static const std::vector<ArgvSpec> specs = []{
-    std::vector<ArgvSpec> result;
-    for(const auto& entry : ARGV_SPECIFICATION) {
-      ArgvSpec spec;
-      spec.index = entry.at("index").get<std::size_t>();
-      spec.key = entry.at("key").get<std::string>();
-      result.push_back(std::move(spec));
-    }
-    std::sort(result.begin(), result.end(),
-      [](const ArgvSpec& a, const ArgvSpec& b){ return a.index < b.index; });
-    return result;
-  }();
-  return specs;
-}
+inline SettingsManager::SettingsManager()
+  : SettingsManager(SETTINGS_SPECIFICATION) {}
 
-inline SettingsManager::SettingsManager() {
+inline SettingsManager::SettingsManager(const nlohmann::json& specification)
+  : setting_specs_(build_setting_specs(specification)) {
   apply_defaults();
 }
 
 inline void SettingsManager::apply_defaults() {
   settings_ = nlohmann::json::object();
-  for(const auto& spec : setting_specs()) {
+  for(const auto& spec : setting_specs_) {
     settings_[spec.key] = spec.default_value;
   }
 }
 
 inline const SettingsManager::SettingSpec* SettingsManager::find_spec(const std::string& token) const {
   std::string lowered = to_lower(token);
-  for(const auto& spec : setting_specs()) {
+  for(const auto& spec : setting_specs_) {
     if(lowered == spec.normalized_key) return &spec;
     if(std::find(spec.aliases.begin(), spec.aliases.end(), lowered) != spec.aliases.end()) {
       return &spec;
     }
   }
   return nullptr;
-}
-
-inline void SettingsManager::init(int argc, char* argv[]) {
-  processname_ = (argc > 0 && argv[0]) ? argv[0] : "sync";
-  apply_defaults();
-  load();
-  parse_args(argc, argv);
-  if(help_requested()) {
-    usage();
-    std::exit(0);
-  }
-}
-
-inline void SettingsManager::usage() const {
-  print_out("{} - mesh sync node", processname_);
-  print_out("Usage:");
-
-  std::string cmd = processname_;
-  for(const auto& pos : argv_specs()) {
-    cmd += " [" + pos.key + "]";
-  }
-  print_out("  {}", cmd);
-  print_out("");
-  print_out("Options:");
-  for(const auto& spec : setting_specs()) {
-    std::string argument_hint = (spec.type == "bool") ? "[true|false]" : "<" + spec.type + ">";
-    std::ostringstream aliases;
-    if(!spec.aliases.empty()) {
-      aliases << " (alias: ";
-      for(std::size_t i = 0; i < spec.aliases.size(); ++i) {
-        if(i > 0) aliases << ", ";
-        aliases << "-" << spec.aliases[i];
-      }
-      aliases << ")";
-    }
-    print_out("  --{} {:<12} {}{} (default: {})",
-              spec.key,
-              argument_hint,
-              spec.description,
-              aliases.str(),
-              default_to_string(spec));
-  }
-  print_out("");
-}
-
-inline void SettingsManager::parse_args(int argc, char* argv[]) {
-  const std::vector<std::string> args(argv + 1, argv + argc);
-  std::size_t positional_index = 0;
-
-  auto is_option_token = [](const std::string& candidate) {
-    if(candidate.rfind("--", 0) == 0) return true;
-    if(candidate.size() >= 2 && candidate[0] == '-' &&
-       std::isalpha(static_cast<unsigned char>(candidate[1]))) {
-      return true;
-    }
-    return false;
-  };
-
-  for(std::size_t i = 0; i < args.size(); ++i) {
-    const std::string& token = args[i];
-
-    if(token.rfind("--", 0) == 0) {
-      std::string key_token = token.substr(2);
-      const auto* spec = find_spec(key_token);
-      if(!spec) {
-        print_err("Unknown option {}", token);
-        usage();
-        std::exit(1);
-      }
-
-      std::string value;
-      if(spec->type == "bool") {
-        if(i + 1 < args.size() && !is_option_token(args[i + 1]) && is_bool_literal(args[i + 1])) {
-          value = args[++i];
-        } else {
-          value = "true";
-        }
-      } else {
-        if(i + 1 >= args.size()) {
-          print_err("Missing value for --{}", spec->key);
-          usage();
-          std::exit(1);
-        }
-        value = args[++i];
-      }
-
-      std::string error;
-      if(!set_from_string(spec->key, value, error)) {
-        print_err("Invalid value for --{}: {}", spec->key, error);
-        usage();
-        std::exit(1);
-      }
-      continue;
-    }
-
-    if(token.size() > 1 && token[0] == '-' && token[1] != '-') {
-      std::string alias_token = token.substr(1);
-      const auto* spec = find_spec(alias_token);
-      bool is_alias = false;
-      if(spec) {
-        std::string lowered_alias = to_lower(alias_token);
-        is_alias = std::find(spec->aliases.begin(), spec->aliases.end(), lowered_alias) != spec->aliases.end();
-      }
-      if(spec && is_alias) {
-        std::string value;
-        if(spec->type == "bool") {
-          if(i + 1 < args.size() && !is_option_token(args[i + 1]) && is_bool_literal(args[i + 1])) {
-            value = args[++i];
-          } else {
-            value = "true";
-          }
-        } else {
-          if(i + 1 >= args.size()) {
-            print_err("Missing value for -{}", alias_token);
-            usage();
-            std::exit(1);
-          }
-          value = args[++i];
-        }
-
-        std::string error;
-        if(!set_from_string(spec->key, value, error)) {
-          print_err("Invalid value for -{}: {}", alias_token, error);
-          usage();
-          std::exit(1);
-        }
-        continue;
-      }
-      // Not a recognised alias; fall through to positional handling.
-    }
-
-    if(positional_index >= argv_specs().size()) {
-      print_err("Unexpected positional argument '{}'", token);
-      usage();
-      std::exit(1);
-    }
-
-    const auto& pos_spec = argv_specs()[positional_index++];
-    std::string error;
-    if(!set_from_string(pos_spec.key, token, error)) {
-      print_err("Invalid value for {} '{}': {}", pos_spec.key, token, error);
-      usage();
-      std::exit(1);
-    }
-  }
 }
 
 inline bool SettingsManager::has(const std::string& key) const {
@@ -336,12 +167,27 @@ inline std::string SettingsManager::value_as_string(const std::string& key) cons
   return value.dump();
 }
 
+inline void SettingsManager::set_settings_path(const std::filesystem::path& path) {
+  settings_path_override_ = path;
+}
+
 inline std::filesystem::path SettingsManager::settings_path() const {
+  if(!settings_path_override_.empty()) {
+    return settings_path_override_;
+  }
   return std::filesystem::current_path() / ".config" / "settings.json";
 }
 
 inline bool SettingsManager::load() {
-  auto path = settings_path();
+  return load_from_file(settings_path());
+}
+
+inline bool SettingsManager::save() const {
+  return save_to_file(settings_path());
+}
+
+inline bool SettingsManager::load_from_file(const std::filesystem::path& path) {
+  if(path.empty()) return false;
   std::ifstream in(path);
   if(!in) return false;
   try {
@@ -350,9 +196,24 @@ inline bool SettingsManager::load() {
     merge_from_json(doc);
     return true;
   } catch(const std::exception& e) {
-    print_err("Failed to parse settings.json: {}", e.what());
+    print_err("Failed to parse {}: {}", path.string(), e.what());
     return false;
   }
+}
+
+inline bool SettingsManager::save_to_file(const std::filesystem::path& path) const {
+  if(path.empty()) return false;
+  std::error_code ec;
+  if(path.has_parent_path()) {
+    std::filesystem::create_directories(path.parent_path(), ec);
+  }
+  std::ofstream out(path);
+  if(!out) {
+    print_err("Unable to write {}", path.string());
+    return false;
+  }
+  out << get_json(true).dump(2);
+  return true;
 }
 
 inline void SettingsManager::merge_from_json(const nlohmann::json& doc) {
@@ -367,24 +228,19 @@ inline void SettingsManager::merge_from_json(const nlohmann::json& doc) {
   }
 }
 
-inline bool SettingsManager::save() const {
-  auto path = settings_path();
-  std::error_code ec;
-  std::filesystem::create_directories(path.parent_path(), ec);
-  std::ofstream out(path);
-  if(!out) {
-    print_err("Unable to write {}", path.string());
-    return false;
-  }
+inline void SettingsManager::set_json(const nlohmann::json& doc) {
+  merge_from_json(doc);
+}
+
+inline nlohmann::json SettingsManager::get_json(bool persistent_only) const {
   nlohmann::json doc = nlohmann::json::object();
   for(const auto& spec : setting_specs()) {
-    if(!spec.persistent) continue;
+    if(persistent_only && !spec.persistent) continue;
     if(settings_.contains(spec.key)) {
       doc[spec.key] = settings_.at(spec.key);
     }
   }
-  out << doc.dump(2);
-  return true;
+  return doc;
 }
 
 inline bool SettingsManager::convert_and_store(const SettingSpec& spec,
@@ -490,7 +346,7 @@ inline bool SettingsManager::set_from_string(const std::string& key,
   return convert_and_store(*spec, parsed, error);
 }
 
-inline bool SettingsManager::set(const std::string& key,
+inline bool SettingsManager::set_from_json(const std::string& key,
                                     const nlohmann::json& value,
                                     std::string& error) {
   const auto* spec = find_spec(key);
@@ -539,6 +395,11 @@ inline std::optional<std::string> SettingsManager::resolve_key(const std::string
     return spec->key;
   }
   return std::nullopt;
+}
+
+inline bool SettingsManager::is_bool_setting(const std::string& key) const {
+  const auto* spec = find_spec(key);
+  return spec && spec->type == "bool";
 }
 
 template<typename T>

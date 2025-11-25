@@ -44,6 +44,11 @@ Useful one-liner to iterate using 3 peers on your desktop:
 ./kill.sh ; make && ./run.sh
 ```
 
+Useful one-liner to iterate using the unit test suite:
+```
+make && cd build/Release && ./mesh_test_runner; cd -
+```
+
 Using the CLI
 -------------
 Start the application (`build/Release/sync` or `build/Debug/sync`) and interact at the `>` prompt.

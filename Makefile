@@ -31,10 +31,10 @@ build_the_thing:
 	cd build && cmake --build ${BUILD_TYPE} --config ${BUILD_TYPE} -j8
 	ls build/*/sync
 
-./build/Debug/sync: src/*.cpp src/*.hpp
+./build/Debug/sync: src/*.cpp src/*.hpp tests/*.hpp tests/*.cpp
 	$(MAKE) build_the_thing BUILD_TYPE=Debug
 
-./build/Release/sync: src/*.cpp src/*.hpp
+./build/Release/sync: src/*.cpp src/*.hpp tests/*.hpp tests/*.cpp
 	$(MAKE) build_the_thing BUILD_TYPE=Release
 
 # run the xcode apple debugger

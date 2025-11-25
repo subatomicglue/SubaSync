@@ -13,6 +13,7 @@
 #include <memory>
 #include <nlohmann/json.hpp>
 #include "protocol.hpp"
+#include "log.hpp"
 
 struct PeerInfo {
   std::string peer_id;
@@ -74,8 +75,9 @@ public:
                 std::string local_peer_id,
                 std::string display_name,
                 std::string local_addr,
-                std::string external_addr = "",
-                size_t max_peers = 6);
+                std::string external_addr,
+                size_t max_peers,
+                std::shared_ptr<EngineLogger> logger = nullptr);
 
 
     // Add or update a discovered peer (e.g. from announce)
@@ -104,6 +106,7 @@ public:
     std::string local_addr() const { return local_addr_; }
     std::string display_name() const { return display_name_; }
     std::string external_addr() const { return external_addr_; }
+    std::shared_ptr<EngineLogger> logger() const { return logger_; }
 
     void register_local_share(const std::string& hash,
                               const std::string& relative_path,
@@ -172,6 +175,9 @@ public:
     void set_transfer_debug(bool enabled);
     bool transfer_debug_enabled() const;
 
+    std::size_t known_peer_count() const;
+    std::size_t connected_peer_count() const;
+
 private:
     asio::io_context& io_;
     std::string local_peer_id_;
@@ -198,6 +204,7 @@ private:
     std::atomic<uint64_t> chunk_request_counter_{0};
 
     std::function<void(const std::string&, const std::string&)> chat_callback_;
+    std::shared_ptr<EngineLogger> logger_;
     mutable std::mutex chat_callback_mutex_;
     std::function<void()> listing_refresh_callback_;
     std::atomic<bool> transfer_debug_{false};
