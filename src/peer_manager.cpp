@@ -67,7 +67,7 @@ PeerManager::PeerManager(asio::io_context& io,
                          std::string local_addr,
                          std::string external_addr,
                          size_t max_peers,
-                         std::shared_ptr<EngineLogger> logger)
+                         std::shared_ptr<Logger> logger)
     : io_(io),
       local_peer_id_(std::move(local_peer_id)),
       local_addr_(std::move(local_addr)),
@@ -77,7 +77,9 @@ PeerManager::PeerManager(asio::io_context& io,
       logger_(std::move(logger))
 {
   if(!logger_) {
-    logger_ = std::make_shared<EngineLogger>(local_peer_id_);
+    logger_ = std::make_shared<Logger>(local_peer_id_);
+  } else if(logger_->name().empty()) {
+    logger_->set_name(local_peer_id_);
   }
   // Add self to peers list
   PeerInfo self;

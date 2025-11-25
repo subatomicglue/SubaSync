@@ -108,6 +108,7 @@ bool test_basic_connection(TestContext& ctx) {
   opt_a.start_cli_thread = false;
 
   MeshEngine engine_a(settings_a, opt_a);
+  ctx.logs.attach(engine_a, opt_a.display_name);
   engine_a.start();
   engine_a.start_background();
   if(ctx.verbose) {
@@ -135,6 +136,7 @@ bool test_basic_connection(TestContext& ctx) {
   opt_b.start_cli_thread = false;
 
   MeshEngine engine_b(settings_b, opt_b);
+  ctx.logs.attach(engine_b, opt_b.display_name);
   engine_b.start();
   engine_b.start_background();
   if(ctx.verbose) {
@@ -149,6 +151,7 @@ bool test_basic_connection(TestContext& ctx) {
 
   engine_b.stop();
   engine_a.stop();
+  ctx.logs.detach_all();
   std::error_code ec;
   std::filesystem::remove_all(cfg.root, ec);
   return ok && saw;

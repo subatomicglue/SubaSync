@@ -196,7 +196,7 @@ inline bool SettingsManager::load_from_file(const std::filesystem::path& path) {
     merge_from_json(doc);
     return true;
   } catch(const std::exception& e) {
-    print_err("Failed to parse {}: {}", path.string(), e.what());
+    print_err(nullptr, "Failed to parse {}: {}", path.string(), e.what());
     return false;
   }
 }
@@ -209,7 +209,7 @@ inline bool SettingsManager::save_to_file(const std::filesystem::path& path) con
   }
   std::ofstream out(path);
   if(!out) {
-    print_err("Unable to write {}", path.string());
+    print_err(nullptr, "Unable to write {}", path.string());
     return false;
   }
   out << get_json(true).dump(2);
@@ -223,7 +223,7 @@ inline void SettingsManager::merge_from_json(const nlohmann::json& doc) {
     if(!spec) continue;
     std::string error;
     if(!convert_and_store(*spec, item.value(), error) && !error.empty()) {
-      print_err("Ignoring invalid setting '{}': {}", item.key(), error);
+      print_err(nullptr, "Ignoring invalid setting '{}': {}", item.key(), error);
     }
   }
 }

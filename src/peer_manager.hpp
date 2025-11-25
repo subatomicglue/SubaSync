@@ -77,7 +77,7 @@ public:
                 std::string local_addr,
                 std::string external_addr,
                 size_t max_peers,
-                std::shared_ptr<EngineLogger> logger = nullptr);
+                std::shared_ptr<Logger> logger = nullptr);
 
 
     // Add or update a discovered peer (e.g. from announce)
@@ -106,7 +106,7 @@ public:
     std::string local_addr() const { return local_addr_; }
     std::string display_name() const { return display_name_; }
     std::string external_addr() const { return external_addr_; }
-    std::shared_ptr<EngineLogger> logger() const { return logger_; }
+    std::shared_ptr<Logger> logger() const { return logger_; }
 
     void register_local_share(const std::string& hash,
                               const std::string& relative_path,
@@ -204,7 +204,7 @@ private:
     std::atomic<uint64_t> chunk_request_counter_{0};
 
     std::function<void(const std::string&, const std::string&)> chat_callback_;
-    std::shared_ptr<EngineLogger> logger_;
+    std::shared_ptr<Logger> logger_;
     mutable std::mutex chat_callback_mutex_;
     std::function<void()> listing_refresh_callback_;
     std::atomic<bool> transfer_debug_{false};

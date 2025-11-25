@@ -38,6 +38,7 @@
 
 #include <nlohmann/json.hpp>
 #include <openssl/sha.h>
+#include <fmt/format.h>
 
 #include "peer_manager.hpp"
 #include "utils.hpp"
@@ -48,10 +49,14 @@ class MeshCLI {
 public:
   explicit MeshCLI(std::shared_ptr<PeerManager> pm,
                    std::shared_ptr<SettingsManager> settings,
+                   std::shared_ptr<Logger> logger,
                    std::chrono::seconds default_watch_interval = std::chrono::seconds(60),
                    bool audio_notifications = false,
                    std::filesystem::path workspace_root = std::filesystem::current_path())
-    : pm_(std::move(pm)), settings_(std::move(settings)), running_(true),
+    : pm_(std::move(pm)),
+      settings_(std::move(settings)),
+      logger_(std::move(logger)),
+      running_(true),
       default_watch_interval_(default_watch_interval), audio_notifications_(audio_notifications),
       workspace_root_(std::move(workspace_root)) {
     ensure_directories();
@@ -116,6 +121,7 @@ private:
 
   std::shared_ptr<PeerManager> pm_;
   std::shared_ptr<SettingsManager> settings_;
+  std::shared_ptr<Logger> logger_;
   std::atomic<bool> running_;
   std::thread cli_thread_;
   std::chrono::seconds default_watch_interval_;
@@ -307,8 +313,7 @@ private:
       }
       handle_watch_command(forwarded);
     } else if(cmd == "bell") {
-      std::cout << '\a';
-      std::cout.flush();
+      cli_beep();
     } else if(cmd == "settings" || cmd == "s") {
       std::string args;
       std::getline(iss, args);
@@ -351,7 +356,7 @@ private:
     } else if(cmd == "help" || cmd == "h" || cmd == "?") {
       print_help();
     } else if(cmd == "quit") {
-      std::cout << "Quitting...\n";
+      cli_print("Quitting...\n");
       exit(-1);
     } else if(cmd == "dirs") {
       print_dirs();
@@ -359,7 +364,7 @@ private:
       print_current_directory();
     } else {
       print_help();
-      std::cout << "Unknown command: " << cmd << "\n";
+      cli_print("Unknown command: {}\n", cmd);
     }
   }
 
@@ -374,15 +379,14 @@ private:
     j["from"] = pm_->local_peer_id();
     j["text"] = msg;
     pm_->broadcast_json(j);
-    std::cout << "[you] " << msg << "\n";
+    cli_print("[you] {}\n", msg);
   }
 
   void on_chat_message(const std::string& from, const std::string& text) {
     if(audio_notifications_) {
-      std::cout << '\a';
+      cli_beep();
     }
-    std::cout << "[" << from << "] " << text << "\n> ";
-    std::cout.flush();
+    cli_print("[{}] {}\n> ", from, text);
   }
 
   std::optional<std::string> read_command_line(const char* prompt) {
@@ -409,8 +413,7 @@ private:
   }
 
   std::optional<std::string> read_command_line_simple(const char* prompt) {
-    std::cout << prompt;
-    std::cout.flush();
+    cli_print("{}", prompt);
     std::string line;
     if(!std::getline(std::cin, line)) return std::nullopt;
     append_history_entry(line);
@@ -445,13 +448,12 @@ private:
                     const std::string& buffer,
                     std::size_t cursor) {
     const char* safe_prompt = prompt ? prompt : "";
-    std::cout << "\r" << safe_prompt << buffer << "\x1b[K";
+    cli_print("\r{}{}\x1b[K", safe_prompt, buffer);
     std::size_t displayed = std::strlen(safe_prompt) + buffer.size();
     std::size_t target = std::strlen(safe_prompt) + cursor;
     if(displayed > target) {
-      std::cout << "\x1b[" << (displayed - target) << "D";
+      cli_print("\x1b[{}D", displayed - target);
     }
-    std::cout.flush();
   }
 
   std::optional<std::string> read_command_line_fallback(const char* prompt) {
@@ -470,8 +472,7 @@ private:
     std::size_t history_index = cli_history_.size();
     std::size_t cursor = 0;
     const char* safe_prompt = prompt ? prompt : "";
-    std::cout << safe_prompt;
-    std::cout.flush();
+    cli_print("{}", safe_prompt);
 
     while(true) {
       char ch = 0;
@@ -480,7 +481,7 @@ private:
         return std::nullopt;
       }
       if(ch == '\r' || ch == '\n') {
-        std::cout << "\n";
+        cli_print("\n");
         break;
       }
       if(ch == 4) {
@@ -588,9 +589,11 @@ private:
     for(const auto& p : arr) {
       const std::string peer_id = p["peer_id"].get<std::string>();
       const std::string& name = p["display_name"].get_ref<const std::string&>();
-      std::cout << peer_id << " (" << name << ")";
-      if(peer_id == local_id) std::cout << " [you]";
-      std::cout << "\n";
+      if(peer_id == local_id) {
+        cli_print("{} ({}) [you]\n", peer_id, name);
+      } else {
+        cli_print("{} ({})\n", peer_id, name);
+      }
     }
   }
 
@@ -598,13 +601,13 @@ private:
     if(arg == "all") {
       auto peers = pm_->make_peer_list_json();
       if(peers.empty()) {
-        std::cout << "No peers available.\n";
+        cli_print("No peers available.\n");
         return;
       }
 
       bool first = true;
       for(const auto& peer_entry : peers) {
-        if(!first) std::cout << "\n";
+        if(!first) cli_print("\n");
         first = false;
 
         const std::string peer_id = peer_entry["peer_id"].get<std::string>();
@@ -620,61 +623,61 @@ private:
     bool show_peers = arg.empty();
     auto parsed = parse_list_command(arg);
     if(!parsed) {
-      std::cout << "Invalid list target.\n";
+      cli_print("Invalid list target.\n");
       return;
     }
 
     if(show_peers) {
-      std::cout << "Peers:\n";
+      cli_print("Peers:\n");
       list_peers();
-      std::cout << "\n";
+      cli_print("\n");
     }
 
     const std::string local_peer = pm_->local_peer_id();
 
     switch(parsed->type) {
       case ListCommand::Type::LocalPath:
-        std::cout << "Local listing (" << local_peer << ")\n";
+        cli_print("Local listing ({})\n", local_peer);
         list_local(parsed->path);
         break;
       case ListCommand::Type::RemotePath:
         if(parsed->peer == local_peer) {
-          std::cout << "Local listing (" << local_peer << ")\n";
+          cli_print("Local listing ({})\n", local_peer);
           list_local(parsed->path);
         } else {
-          std::cout << "Remote listing (" << parsed->peer << ")\n";
+          cli_print("Remote listing ({})\n", parsed->peer);
           list_remote_path(parsed->peer, parsed->path, "");
         }
         break;
       case ListCommand::Type::RemoteHash:
         if(parsed->peer == local_peer) {
-          std::cout << "Local listing (" << local_peer << ")\n";
+          cli_print("Local listing ({})\n", local_peer);
           auto entries = pm_->local_listing_for_hash(parsed->hash);
           auto items = make_remote_listing_items(entries);
           if(items.empty()) {
-            std::cout << "Hash not found on " << local_peer << ".\n";
+            cli_print("Hash not found on {}.\n", local_peer);
           } else {
             print_listing(items);
           }
         } else {
-          std::cout << "Remote hash listing (" << parsed->peer << ")\n";
+          cli_print("Remote hash listing ({})\n", parsed->peer);
           list_remote_hash(parsed->peer, parsed->hash);
         }
         break;
       case ListCommand::Type::HashAll:
-        std::cout << "Mesh hash listing (" << parsed->hash << ")\n";
+        cli_print("Mesh hash listing ({})\n", parsed->hash);
         list_all_hash(parsed->hash);
         break;
       case ListCommand::Type::DirectoryGuid:
-        std::cout << "Local directory listing (" << local_peer << ")\n";
+        cli_print("Local directory listing ({})\n", local_peer);
         list_local_dir_guid(parsed->dir_guid);
         break;
       case ListCommand::Type::RemoteDirectoryGuid:
         if(parsed->peer == local_peer) {
-          std::cout << "Local directory listing (" << local_peer << ")\n";
+          cli_print("Local directory listing ({})\n", local_peer);
           list_local_dir_guid(parsed->dir_guid);
         } else {
-          std::cout << "Remote directory listing (" << parsed->peer << ")\n";
+          cli_print("Remote directory listing ({})\n", parsed->peer);
           list_remote_path(parsed->peer, "", parsed->dir_guid);
         }
         break;
@@ -685,12 +688,12 @@ private:
     auto orphaned = index_share_root();
     auto normalized = normalize_cli_path(cli_path);
     if(is_internal_listing_path(normalized)) {
-      std::cout << "Path is reserved for staging.\n";
+      cli_print("Path is reserved for staging.\n");
       return;
     }
     auto items = pm_->local_listing_items_for_path(normalized);
     if(items.empty()) {
-      std::cout << "Listing is empty.\n";
+      cli_print("Listing is empty.\n");
       return;
     }
     maybe_suggest_guid_mapping(items);
@@ -702,7 +705,7 @@ private:
     auto orphaned = index_share_root();
     auto items = pm_->local_listing_for_dir_guid(guid);
     if(items.empty()) {
-      std::cout << "Directory not found for GUID " << guid << "\n";
+      cli_print("Directory not found for GUID {}\n", guid);
       return;
     }
     maybe_suggest_guid_mapping(items);
@@ -713,12 +716,12 @@ private:
   void list_remote_path(const std::string& peer, const std::string& cli_path, const std::string& dir_guid) {
     auto normalized = normalize_cli_path(cli_path);
     if(dir_guid.empty() && !normalized.empty() && is_internal_listing_path(normalized)) {
-      std::cout << "Path is reserved on " << peer << ".\n";
+      cli_print("Path is reserved on {}.\n", peer);
       return;
     }
     auto items = blocking_list_peer(peer, normalized, "", dir_guid);
     if(items.empty()) {
-      std::cout << "No entries from " << peer << " for path.\n";
+      cli_print("No entries from {} for path.\n", peer);
       return;
     }
     print_listing(items);
@@ -727,7 +730,7 @@ private:
   void list_remote_hash(const std::string& peer, const std::string& hash) {
     auto items = blocking_list_peer(peer, "", hash, "");
     if(items.empty()) {
-      std::cout << "Hash not found on " << peer << ".\n";
+      cli_print("Hash not found on {}.\n", peer);
       return;
     }
     print_listing(items);
@@ -736,7 +739,7 @@ private:
   void list_all_hash(const std::string& hash) {
     auto items = blocking_list_hash(hash);
     if(items.empty()) {
-      std::cout << "Hash not found on any peer.\n";
+      cli_print("Hash not found on any peer.\n");
       return;
     }
     print_listing(items);
@@ -746,7 +749,7 @@ private:
     auto resolved = resolve_share_path(raw_path);
     std::error_code ec;
     if(!std::filesystem::exists(resolved, ec)) {
-      std::cout << "File or directory not found: " << resolved << "\n";
+      cli_print("File or directory not found: {}\n", resolved);
       return;
     }
 
@@ -761,15 +764,15 @@ private:
         }
       }
       if(ec) {
-        std::cout << "Error while traversing: " << ec.message() << "\n";
+        cli_print("Error while traversing: {}\n", ec.message());
       }
     } else {
-      std::cout << "Unsupported file type: " << resolved << "\n";
+      cli_print("Unsupported file type: {}\n", resolved);
       return;
     }
 
     if(shared_count == 0) {
-      std::cout << "No files were shared.\n";
+      cli_print("No files were shared.\n");
     }
   }
 
@@ -790,7 +793,7 @@ private:
         std::getline(prefix, remainder);
         trim(remainder);
         if(remainder.empty()) {
-          std::cout << "Usage: sync force <resource>\n";
+          cli_print("Usage: sync force <resource>\n");
         } else {
           sync_force_command(remainder);
         }
@@ -809,10 +812,10 @@ private:
         }
       }
       if(bumped == 0) {
-        std::cout << "No watches configured.\n";
+        cli_print("No watches configured.\n");
       } else {
         watch_cv_.notify_all();
-        std::cout << "Triggered " << bumped << " watch" << (bumped == 1 ? "" : "es") << " for immediate sync.\n";
+        cli_print("Triggered {} watch{} for immediate sync.\n", bumped, bumped == 1 ? "" : "es");
       }
       return;
     }
@@ -836,28 +839,28 @@ private:
       dest_override = normalize_cli_path(dest_raw);
     }
     if(dest_override && is_internal_listing_path(*dest_override)) {
-      std::cout << "Destination path is reserved for staging.\n";
+      cli_print("Destination path is reserved for staging.\n");
       return;
     }
 
     auto resolved = resolve_resource_identifier(source_arg);
     if(!resolved) {
-      std::cout << "Invalid sync target.\n";
+      cli_print("Invalid sync target.\n");
       return;
     }
 
     if(resolved->kind == ResourceIdentifier::Kind::Watch) {
       if(dest_override) {
-        std::cout << "Destination overrides are not supported when syncing a watch.\n";
+        cli_print("Destination overrides are not supported when syncing a watch.\n");
         return;
       }
       auto result = run_single_watch(resolved->watch);
       if(!result.success) {
-        std::cout << "[watch " << resolved->watch.id << "] sync failed.\n";
+        cli_print("[watch {}] sync failed.\n", resolved->watch.id);
       } else if(!result.changed) {
-        std::cout << "[watch " << resolved->watch.id << "] already up to date.\n";
+        cli_print("[watch {}] already up to date.\n", resolved->watch.id);
       } else {
-        std::cout << "[watch " << resolved->watch.id << "] synced.\n";
+        cli_print("[watch {}] synced.\n", resolved->watch.id);
       }
       return;
     }
@@ -868,8 +871,8 @@ private:
         parsed.type == ListCommand::Type::RemoteHash ||
         parsed.type == ListCommand::Type::RemoteDirectoryGuid) &&
         parsed.peer == pm_->local_peer_id()) {
-      std::cout << "Cannot sync from self.\n";
-      std::cout << "Nothing to sync.\n";
+      cli_print("Cannot sync from self.\n");
+      cli_print("Nothing to sync.\n");
       return;
     }
 
@@ -877,7 +880,7 @@ private:
     switch(parsed.type) {
       case ListCommand::Type::RemotePath:
         if(is_internal_listing_path(parsed.path)) {
-          std::cout << "Path is reserved on " << parsed.peer << ".\n";
+          cli_print("Path is reserved on {}.\n", parsed.peer);
           return;
         }
         entries = blocking_list_peer(parsed.peer, parsed.path, "", "");
@@ -895,7 +898,7 @@ private:
         entries = blocking_list_peer(parsed.peer, "", "", parsed.dir_guid);
         break;
       case ListCommand::Type::LocalPath:
-        std::cout << "Sync expects a peer or hash target.\n";
+        cli_print("Sync expects a peer or hash target.\n");
         return;
     }
 
@@ -907,15 +910,15 @@ private:
     notify_untrusted_directory_sources(entries);
 
     if(entries.empty()) {
-      std::cout << "Nothing to sync.\n";
+      cli_print("Nothing to sync.\n");
       return;
     }
 
     auto result = perform_sync(parsed, std::move(entries), dest_override, dest_is_directory, false, nullptr);
     if(!result.success) {
-      std::cout << "Sync failed.\n";
+      cli_print("Sync failed.\n");
     } else if(!result.changed) {
-      std::cout << "Already up to date.\n";
+      cli_print("Already up to date.\n");
     }
   }
 
@@ -923,35 +926,37 @@ private:
     std::string trimmed = resource_spec;
     trim(trimmed);
     if(trimmed.empty()) {
-      std::cout << "Usage: sync force <resource>\n";
+      cli_print("Usage: sync force <resource>\n");
       return;
     }
 
     auto resolved = resolve_resource_identifier(trimmed);
     if(!resolved) {
-      std::cout << "Invalid resource identifier.\n";
+      cli_print("Invalid resource identifier.\n");
       return;
     }
 
     std::vector<std::string> warnings;
     auto targets = resource_local_targets(*resolved, &warnings);
     for(const auto& warning : warnings) {
-      std::cout << warning << "\n";
+      cli_print("{}\n", warning);
     }
 
     if(targets.empty()) {
-      std::cout << "No local data found for " << describe_resource(*resolved) << ".\n";
+      cli_print("No local data found for {}.\n", describe_resource(*resolved));
     } else {
       auto stats = purge_local_paths(targets);
       index_share_root();
       if(stats.deleted > 0 || stats.missing > 0 || stats.failed > 0) {
-        std::cout << "force-sync removed " << stats.deleted << " target"
-                  << (stats.deleted == 1 ? "" : "s")
-                  << ", " << stats.missing << " already missing";
+        std::string failed_suffix;
         if(stats.failed > 0) {
-          std::cout << ", " << stats.failed << " failed";
+          failed_suffix = fmt::format(", {} failed", stats.failed);
         }
-        std::cout << ".\n";
+        cli_print("force-sync removed {} target{}, {} already missing{}.\n",
+                  stats.deleted,
+                  stats.deleted == 1 ? "" : "s",
+                  stats.missing,
+                  failed_suffix);
       }
     }
 
@@ -1274,7 +1279,7 @@ private:
                              const std::filesystem::path& dest_root,
                              bool quiet,
                              const WatchEntry* watch_context) {
-    auto entries = blocking_list_peer(peer_id, remote_path, "", "");
+    auto entries = blocking_list_peer(peer_id, remote_path, "", "", quiet);
     entries.erase(std::remove_if(entries.begin(), entries.end(),
       [](const PeerManager::RemoteListingItem& item){
         return is_internal_listing_path(item.relative_path);
@@ -2030,7 +2035,7 @@ private:
         if(src.peer.empty()) continue;
         if(src.peer == pm_->local_peer_id()) continue;
         if(src.path.empty()) continue;
-        auto resolved = resolve_remote_dir_guid(src.peer, src.path);
+        auto resolved = resolve_remote_dir_guid(src.peer, src.path, nullptr, true);
         if(resolved) {
           current.dir_guid = resolved->guid;
           if(!resolved->origin_peer.empty()) {
@@ -2100,7 +2105,8 @@ private:
       auto entries = blocking_list_peer(candidate.peer,
                                         current.dir_guid.empty() ? candidate.path : "",
                                         "",
-                                        current.dir_guid);
+                                        current.dir_guid,
+                                        true);
       entries.erase(std::remove_if(entries.begin(), entries.end(),
         [](const PeerManager::RemoteListingItem& item){
           return is_internal_listing_path(item.relative_path);
@@ -2191,13 +2197,14 @@ private:
 
   std::optional<ResolvedDirGuid> resolve_remote_dir_guid(const std::string& peer,
                                                          const std::string& path,
-                                                         bool* path_was_file = nullptr) {
+                                                         bool* path_was_file = nullptr,
+                                                         bool silent = false) {
     if(path_was_file) *path_was_file = false;
     auto normalized = normalize_cli_path(path);
     if(normalized.empty()) return std::nullopt;
     std::filesystem::path p(normalized);
     auto parent = normalize_cli_path(p.parent_path().generic_string());
-    auto listings = blocking_list_peer(peer, parent, "", "");
+    auto listings = blocking_list_peer(peer, parent, "", "", silent);
     listings.erase(std::remove_if(listings.begin(), listings.end(),
       [](const PeerManager::RemoteListingItem& item){
         return is_internal_listing_path(item.relative_path);
@@ -4730,6 +4737,24 @@ private:
     return false;
   }
 
+  Logger* logger() const {
+    return logger_.get();
+  }
+
+  template<typename... Args>
+  void cli_print(spdlog::format_string_t<Args...> fmt, Args&&... args) const {
+    print_out(logger(), fmt, std::forward<Args>(args)...);
+  }
+
+  template<typename... Args>
+  void cli_print_err(spdlog::format_string_t<Args...> fmt, Args&&... args) const {
+    print_err(logger(), fmt, std::forward<Args>(args)...);
+  }
+
+  void cli_beep() const {
+    cli_print("{}", "\a");
+  }
+
   std::optional<ListCommand> parse_list_command(const std::string& raw) {
     std::string input = raw;
     trim(input);
@@ -4819,6 +4844,7 @@ private:
                                             const std::string& dir_guid,
                                             bool silent) const {
     PeerListingResult result;
+    auto sink = logger();
     auto promise = std::make_shared<std::promise<std::vector<PeerManager::RemoteListingItem>>>();
     auto future = promise->get_future();
     bool requested = pm_->request_peer_listing(peer, path, hash, dir_guid,
@@ -4827,7 +4853,9 @@ private:
       });
     if(!requested) {
       if(!silent) {
-        std::cout << "Peer " << peer << " is not connected.\n";
+        print_out(sink, "Peer {} is not connected.", peer);
+      } else {
+        log_debug(sink, "Peer {} is not connected (silent fetch).", peer);
       }
       result.state = PeerListingState::NotConnected;
       return result;
@@ -4835,7 +4863,9 @@ private:
     auto status = future.wait_for(std::chrono::seconds(5));
     if(status != std::future_status::ready) {
       if(!silent) {
-        std::cout << "Timed out waiting for response from " << peer << ".\n";
+        print_out(sink, "Timed out waiting for response from {}.", peer);
+      } else {
+        log_debug(sink, "Timed out waiting for response from {} (silent fetch).", peer);
       }
       result.state = PeerListingState::Timeout;
       return result;
@@ -4856,8 +4886,9 @@ private:
   std::vector<PeerManager::RemoteListingItem> blocking_list_peer(const std::string& peer,
                                                                  const std::string& path,
                                                                  const std::string& hash,
-                                                                 const std::string& dir_guid) {
-    auto resp = fetch_peer_listing_impl(peer, path, hash, dir_guid, false);
+                                                                 const std::string& dir_guid,
+                                                                 bool silent = false) {
+    auto resp = fetch_peer_listing_impl(peer, path, hash, dir_guid, silent);
     if(resp.state != PeerListingState::Completed) return {};
     return resp.items;
   }

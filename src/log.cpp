@@ -3,8 +3,8 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <atomic>
+#include <cstring>
 #include <mutex>
-#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -13,10 +13,6 @@ std::shared_ptr<spdlog::logger> g_error_logger;
 std::shared_ptr<spdlog::logger> g_print_logger;
 std::shared_ptr<spdlog::logger> g_print_err_logger;
 std::once_flag g_init_once;
-std::mutex g_listener_mutex;
-std::unordered_map<LogListenerHandle, LogListener> g_log_listeners;
-std::atomic<LogListenerHandle> g_next_listener_id{1};
-std::atomic<bool> g_has_log_listeners{false};
 std::atomic<bool> g_log_passthrough{true};
 
 void create_loggers() {
@@ -56,36 +52,6 @@ void ensure_loggers() {
 
 } // namespace
 
-LogListenerHandle add_log_listener(LogListener listener) {
-  if(!listener) return 0;
-  std::lock_guard<std::mutex> lock(g_listener_mutex);
-  LogListenerHandle id = g_next_listener_id++;
-  g_log_listeners.emplace(id, std::move(listener));
-  g_has_log_listeners.store(!g_log_listeners.empty(), std::memory_order_release);
-  return id;
-}
-
-void remove_log_listener(LogListenerHandle handle) {
-  if(handle == 0) return;
-  std::lock_guard<std::mutex> lock(g_listener_mutex);
-  g_log_listeners.erase(handle);
-  g_has_log_listeners.store(!g_log_listeners.empty(), std::memory_order_release);
-}
-
-void clear_log_listeners() {
-  std::lock_guard<std::mutex> lock(g_listener_mutex);
-  g_log_listeners.clear();
-  g_has_log_listeners.store(false, std::memory_order_release);
-}
-
-namespace detail {
-
-bool has_log_listeners() {
-  return g_has_log_listeners.load(std::memory_order_acquire);
-}
-
-} // namespace detail
-
 void set_log_passthrough(bool enabled) {
   g_log_passthrough.store(enabled, std::memory_order_release);
 }
@@ -94,52 +60,60 @@ bool log_passthrough() {
   return g_log_passthrough.load(std::memory_order_acquire);
 }
 
-namespace detail {
+Logger::Logger() = default;
+Logger::Logger(std::string name) : name_(std::move(name)) {}
 
-void dispatch_log_message(const std::string& channel,
-                          spdlog::level::level_enum level,
-                          const std::string& message) {
-  std::vector<LogListener> listeners;
-  {
-    std::lock_guard<std::mutex> lock(g_listener_mutex);
-    for(const auto& entry : g_log_listeners) {
-      if(entry.second) listeners.push_back(entry.second);
-    }
-  }
-  for(auto& listener : listeners) {
-    try {
-      listener(channel, level, message);
-    } catch(...) {
-      // swallow exceptions from listeners
-    }
-  }
+void Logger::set_name(std::string name) {
+  name_ = std::move(name);
 }
 
-} // namespace detail
+LogListenerHandle Logger::add_listener(Listener listener, void* user_data) {
+  if(!listener) return 0;
+  std::lock_guard<std::mutex> lock(listener_mutex_);
+  const auto id = next_listener_id_++;
+  listeners_.emplace(id, ListenerBinding{user_data, std::move(listener)});
+  return id;
+}
 
-EngineLogger::EngineLogger(std::string name)
-  : name_(std::move(name)) {
-  ensure_loggers();
+void Logger::remove_listener(LogListenerHandle handle) {
+  std::lock_guard<std::mutex> lock(listener_mutex_);
+  listeners_.erase(handle);
+}
 
-  auto info_sinks = g_info_logger->sinks();
-  info_logger_ = std::make_shared<spdlog::logger>("engine.info." + name_, info_sinks.begin(), info_sinks.end());
-  info_logger_->set_level(g_info_logger->level());
-  info_logger_->flush_on(spdlog::level::warn);
+void Logger::clear_listeners() {
+  std::lock_guard<std::mutex> lock(listener_mutex_);
+  listeners_.clear();
+}
 
-  auto error_sinks = g_error_logger->sinks();
-  error_logger_ = std::make_shared<spdlog::logger>("engine.error." + name_, error_sinks.begin(), error_sinks.end());
-  error_logger_->set_level(g_error_logger->level());
-  error_logger_->flush_on(spdlog::level::err);
+bool Logger::dispatch(const std::string& channel,
+                      spdlog::level::level_enum level,
+                      const std::string& message) {
+  std::vector<ListenerBinding> listeners_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(listener_mutex_);
+    listeners_snapshot.reserve(listeners_.size());
+    for(const auto& entry : listeners_) {
+      listeners_snapshot.push_back(entry.second);
+    }
+  }
+  bool handled = false;
+  for(auto& binding : listeners_snapshot) {
+    try {
+      if(binding.callback && binding.callback(binding.user_data, channel, level, message)) {
+        handled = true;
+      }
+    } catch(...) {
+      // swallow listener exceptions
+    }
+  }
+  return handled;
+}
 
-  auto print_sinks = g_print_logger->sinks();
-  print_logger_ = std::make_shared<spdlog::logger>("engine.print." + name_, print_sinks.begin(), print_sinks.end());
-  print_logger_->set_level(g_print_logger->level());
-  print_logger_->flush_on(spdlog::level::info);
-
-  auto print_err_sinks = g_print_err_logger->sinks();
-  print_error_logger_ = std::make_shared<spdlog::logger>("engine.print_err." + name_, print_err_sinks.begin(), print_err_sinks.end());
-  print_error_logger_->set_level(g_print_err_logger->level());
-  print_error_logger_->flush_on(spdlog::level::err);
+void Logger::fallback(const char* base_channel,
+                      const std::string& channel_name,
+                      spdlog::level::level_enum level,
+                      const std::string& message) {
+  detail::emit_to_default(base_channel, channel_name, level, message);
 }
 
 void init(bool verbose) {
@@ -158,22 +132,32 @@ void init(bool verbose) {
   spdlog::set_level(level);
 }
 
-spdlog::logger& info_logger() {
+namespace detail {
+
+void emit_to_default(const char* base_channel,
+                     const std::string& channel_name,
+                     spdlog::level::level_enum level,
+                     const std::string& message) {
   ensure_loggers();
-  return *g_info_logger;
+  if(!log_passthrough()) return;
+
+  spdlog::logger* sink = nullptr;
+  if(std::strcmp(base_channel, "print") == 0) {
+    sink = g_print_logger.get();
+  } else if(std::strcmp(base_channel, "print_err") == 0) {
+    sink = g_print_err_logger.get();
+  } else if(std::strcmp(base_channel, "error") == 0) {
+    sink = g_error_logger.get();
+  } else {
+    sink = g_info_logger.get();
+  }
+
+  if(!sink) return;
+  if(!channel_name.empty() && channel_name != base_channel) {
+    sink->log(level, fmt::format("[{}] {}", channel_name, message));
+  } else {
+    sink->log(level, message);
+  }
 }
 
-spdlog::logger& error_logger() {
-  ensure_loggers();
-  return *g_error_logger;
-}
-
-spdlog::logger& print_logger() {
-  ensure_loggers();
-  return *g_print_logger;
-}
-
-spdlog::logger& print_error_logger() {
-  ensure_loggers();
-  return *g_print_err_logger;
-}
+} // namespace detail

@@ -12,7 +12,7 @@
 class MeshCLI;
 class PeerManager;
 class SettingsManager;
-class EngineLogger;
+class Logger;
 
 class MeshEngine {
 public:
@@ -25,7 +25,7 @@ public:
     std::filesystem::path workspace_root = std::filesystem::current_path();
   };
 
-  MeshEngine(std::shared_ptr<SettingsManager> settings, Options options);
+  explicit MeshEngine(std::shared_ptr<SettingsManager> settings, Options options);
   ~MeshEngine();
 
   void start();
@@ -36,7 +36,10 @@ public:
   void execute_command(const std::string& line);
 
   std::shared_ptr<SettingsManager> settings() const { return settings_; }
-  std::shared_ptr<EngineLogger> logger() const { return logger_; }
+  std::shared_ptr<Logger> logger() const { return logger_; }
+  LogListenerHandle add_log_listener(Logger::Listener listener, void* user_data = nullptr);
+  void remove_log_listener(LogListenerHandle handle);
+  void clear_log_listeners();
 
   struct Stats {
     std::size_t known_peers = 0;
@@ -48,6 +51,9 @@ public:
   uint16_t listen_port() const { return listen_port_; }
   const std::string& peer_id() const { return peer_id_; }
   const std::filesystem::path& workspace_root() const { return options_.workspace_root; }
+
+  void set_display_name(const std::string& name);
+  void set_external_address(const std::string& address);
 
 private:
   using tcp = asio::ip::tcp;
@@ -72,5 +78,5 @@ private:
   std::string listen_ip_;
   uint16_t listen_port_ = 0;
   std::string bootstrap_peer_;
-  std::shared_ptr<EngineLogger> logger_;
+  std::shared_ptr<Logger> logger_;
 };

@@ -64,7 +64,7 @@ void CommandLineParser::parse(int argc, char* argv[], SettingsManager& settings)
   std::size_t positional_index = 0;
 
   auto fail = [&](const std::string& message){
-    print_err("{}", message);
+    print_err(nullptr, "{}", message);
     usage();
     std::exit(1);
   };
@@ -127,16 +127,16 @@ void CommandLineParser::parse(int argc, char* argv[], SettingsManager& settings)
 }
 
 void CommandLineParser::usage() const {
-  print_out("{} - mesh sync node", process_name_);
-  print_out("Usage:");
+  print_out(nullptr, "{} - mesh sync node", process_name_);
+  print_out(nullptr, "Usage:");
 
   std::string cmd = process_name_;
   for(const auto& pos : positional_specs_) {
     cmd += " [" + pos.key + "]";
   }
-  print_out("  {}", cmd);
-  print_out("");
-  print_out("Options:");
+  print_out(nullptr, "  {}", cmd);
+  print_out(nullptr, "");
+  print_out(nullptr, "Options:");
   for(const auto& entry : settings_spec_) {
     auto key = entry.at("key").get<std::string>();
     auto type = entry.at("type").get<std::string>();
@@ -163,12 +163,12 @@ void CommandLineParser::usage() const {
     } else {
       default_str = default_value.dump();
     }
-    print_out("  --{} {:<12} {}{} (default: {})",
+    print_out(nullptr, "  --{} {:<12} {}{} (default: {})",
               key,
               argument_hint,
               description,
               aliases.str(),
               default_str);
   }
-  print_out("");
+  print_out(nullptr, "");
 }

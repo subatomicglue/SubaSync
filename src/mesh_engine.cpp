@@ -28,7 +28,8 @@ std::string random_peer_id() {
 
 MeshEngine::MeshEngine(std::shared_ptr<SettingsManager> settings, Options options)
   : options_(std::move(options)),
-    settings_(settings ? std::move(settings) : std::make_shared<SettingsManager>()) {
+    settings_(settings ? std::move(settings) : std::make_shared<SettingsManager>()),
+    logger_(std::make_shared<Logger>("mesh-engine")) {
   if(options_.watch_interval.count() <= 0) {
     options_.watch_interval = std::chrono::seconds(60);
   }
@@ -62,7 +63,11 @@ void MeshEngine::start() {
   if(peer_id_.empty()) {
     peer_id_ = random_peer_id();
   }
-  logger_ = std::make_shared<EngineLogger>(peer_id_);
+  if(logger_) {
+    logger_->set_name(peer_id_);
+  } else {
+    logger_ = std::make_shared<Logger>(peer_id_);
+  }
   listen_ip_ = settings_->get<std::string>("listen_ip");
   int listen_port_value = settings_->get<int>("listen_port");
   if(listen_port_value < 0 || listen_port_value > 65535) {
@@ -133,6 +138,7 @@ void MeshEngine::start() {
 
   cli_ = std::make_unique<MeshCLI>(peer_manager_,
                                    settings_,
+                                   logger_,
                                    options_.watch_interval,
                                    audio_notifications,
                                    options_.workspace_root);
@@ -207,6 +213,31 @@ void MeshEngine::stop() {
     io_thread_.join();
   }
   io_.restart();
+}
+
+LogListenerHandle MeshEngine::add_log_listener(Logger::Listener listener, void* user_data) {
+  if(!logger_) return 0;
+  return logger_->add_listener(std::move(listener), user_data);
+}
+
+void MeshEngine::remove_log_listener(LogListenerHandle handle) {
+  if(logger_ && handle != 0) {
+    logger_->remove_listener(handle);
+  }
+}
+
+void MeshEngine::clear_log_listeners() {
+  if(logger_) {
+    logger_->clear_listeners();
+  }
+}
+
+void MeshEngine::set_display_name(const std::string& name) {
+  options_.display_name = name;
+}
+
+void MeshEngine::set_external_address(const std::string& address) {
+  options_.external_address = address;
 }
 
 void MeshEngine::start_cli() {
